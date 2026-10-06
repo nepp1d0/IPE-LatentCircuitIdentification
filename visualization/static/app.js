@@ -21,16 +21,23 @@ const SVGNS = "http://www.w3.org/2000/svg";
 const state = {
 	config: null,
 	meta: null,                 // {tokens, n_layers, n_heads, positional}
+	previewVersion: 0,          // invalidates tokenize responses after edits/tab changes
 	nodes: new Map(),           // id -> node dict
 	edges: new Map(),           // "src->dst" -> {source, target, count, contribution}
 	maxAbs: 0,
 	threshold: 0,
 	method: "tree",
+	savedResults: { tree: null, path: null, acdc: null }, // latest successful run per algorithm
+	drafts: { tree: null, path: null, acdc: null }, // unfinished form for a method with no saved results
 	strategy: "threshold",
 	mode: "noising",
 	jobId: null,
 	es: null,
+	activeJob: null,              // request snapshot and stream metadata for the running job
 	running: false,
+	methodStatus: { tree: null, path: null, acdc: null },
+	methodProgress: { tree: null, path: null, acdc: null },
+	displayingLiveRun: false,
 	result: null,
 	view: { x: 16, y: 8, k: 1 },
 	dirty: false,
@@ -78,8 +85,10 @@ function mix(a, b, t) {
 /* Diverging color for a signed contribution: neutral midpoint -> blue for
  * positive, red for negative, saturating at the strongest |contribution|. */
 function colorFor(c) {
-	if (c === null || c === undefined || state.maxAbs === 0) return null;
-	const t = Math.min(1, Math.abs(c) / state.maxAbs);
+	const live = state.activeJob?.liveState;
+	const maxAbs = live && state.nodes === live.nodes ? live.maxAbs : state.maxAbs;
+	if (c === null || c === undefined || maxAbs === 0) return null;
+	const t = Math.min(1, Math.abs(c) / maxAbs);
 	const pole = c >= 0 ? cssVar("--pos") : cssVar("--neg");
 	return mix(cssVar("--mid"), pole, 0.3 + 0.7 * t);
 }
@@ -97,41 +106,69 @@ function nodeLabel(n) {
 
 /* ------------------------------------------------------------ graph state */
 
-function resetGraph() {
-	state.nodes.clear();
-	state.edges.clear();
-	state.admitQueue.length = 0;
-	state.fresh.clear();
+function clearDisplay(message = "Type a clean prompt to preview the model grid.") {
+	state.nodes = new Map();
+	state.edges = new Map();
+	state.admitQueue = [];
+	state.fresh = new Map();
 	state.maxAbs = 0;
+	state.meta = null;
 	state.result = null;
 	state.threshold = 0;
+	state.hover = null;
+	state.displayingLiveRun = false;
+	$("#threshold-slider").value = 0;
+	$("#threshold-val").textContent = "0";
+	$("#summary").innerHTML = "";
 	$("#result-box").hidden = true;
+	$("#tooltip").hidden = true;
+	$("#empty-state").textContent = message;
 	scheduleRender();
+}
+
+function createLiveGraphState() {
+	return {
+		meta: null,
+		nodes: new Map(),
+		edges: new Map(),
+		maxAbs: 0,
+		threshold: 0,
+		admitQueue: [],
+		fresh: new Map(),
+	};
 }
 
 /* Reveal admitted nodes one by one (draining faster if a burst piles up, e.g.
  * from the beam variants which admit a whole depth at once). */
-function applyAdmit(ev) {
-	mergeNode(ev.parent);
-	mergeNode(ev.node);
-	state.fresh.set(ev.node.id, performance.now());
-	mergeEdge(ev.node.id, ev.parent.id, ev.contribution, ev.node.kind === "embed");
-	if (ev.node.kind === "embed") markCompleteUp(ev.node.id);
+function applyAdmit(ev, graphState = state) {
+	mergeNode(ev.parent, graphState);
+	mergeNode(ev.node, graphState);
+	graphState.fresh.set(ev.node.id, performance.now());
+	mergeEdge(ev.node.id, ev.parent.id, ev.contribution, ev.node.kind === "embed", graphState);
+	if (ev.node.kind === "embed") markCompleteUp(ev.node.id, graphState);
+}
+
+function drainAdmitQueue(graphState, maxItems = null) {
+	const n = maxItems === null
+		? Math.max(1, Math.ceil(graphState.admitQueue.length / 25))
+		: Math.min(maxItems, graphState.admitQueue.length);
+	for (let i = 0; i < n && graphState.admitQueue.length; i++) {
+		applyAdmit(graphState.admitQueue.shift(), graphState);
+	}
 }
 
 setInterval(() => {
-	if (!state.admitQueue.length) return;
-	const n = Math.max(1, Math.ceil(state.admitQueue.length / 25));
-	for (let i = 0; i < n && state.admitQueue.length; i++) {
-		applyAdmit(state.admitQueue.shift());
-	}
-	scheduleRender();
+	const job = state.activeJob;
+	const graphState = job?.liveState || state;
+	if (!graphState.admitQueue.length) return;
+	drainAdmitQueue(graphState);
+	if (!job || isDisplayedJob(job)) scheduleRender();
 }, 60);
 
-function mergeNode(d) {
-	const cur = state.nodes.get(d.id);
+function mergeNode(d, graphState = state) {
+	const cur = graphState.nodes.get(d.id);
 	if (!cur) {
-		state.nodes.set(d.id, {
+		graphState.nodes.set(d.id, {
 			...d,
 			merged: d.merged || 1,
 			complete: d.complete !== undefined ? d.complete : true,
@@ -151,16 +188,16 @@ function mergeNode(d) {
 		if (d.kv_position !== null && d.kv_position !== undefined
 			&& !cur.kv_positions.includes(d.kv_position)) cur.kv_positions.push(d.kv_position);
 	}
-	const c = state.nodes.get(d.id).contribution;
-	if (c !== null && c !== undefined) state.maxAbs = Math.max(state.maxAbs, Math.abs(c));
+	const c = graphState.nodes.get(d.id).contribution;
+	if (c !== null && c !== undefined) graphState.maxAbs = Math.max(graphState.maxAbs, Math.abs(c));
 }
 
-function mergeEdge(srcId, dstId, contribution, complete = false) {
+function mergeEdge(srcId, dstId, contribution, complete = false, graphState = state) {
 	if (srcId === dstId) return;
 	const key = `${srcId}->${dstId}`;
-	const cur = state.edges.get(key);
+	const cur = graphState.edges.get(key);
 	if (!cur) {
-		state.edges.set(key, {
+		graphState.edges.set(key, {
 			source: srcId, target: dstId, count: 1,
 			contribution: contribution ?? null, complete,
 		});
@@ -177,9 +214,9 @@ function mergeEdge(srcId, dstId, contribution, complete = false) {
 
 /* When a branch reaches an embedding, everything upstream of it (toward FINAL)
  * is part of a complete branch: flip those edges to the coral accent. */
-function markCompleteUp(startId) {
+function markCompleteUp(startId, graphState = state) {
 	const bySource = new Map();
-	for (const e of state.edges.values()) {
+	for (const e of graphState.edges.values()) {
 		if (!bySource.has(e.source)) bySource.set(e.source, []);
 		bySource.get(e.source).push(e);
 	}
@@ -196,25 +233,25 @@ function markCompleteUp(startId) {
 	}
 }
 
-function loadGraph(graph) {
-	state.nodes.clear();
-	state.edges.clear();
-	state.maxAbs = 0;
+function loadGraph(graph, graphState = state, shouldRender = true) {
+	graphState.nodes.clear();
+	graphState.edges.clear();
+	graphState.maxAbs = 0;
 	for (const n of graph.nodes) {
-		state.nodes.set(n.id, { ...n });
+		graphState.nodes.set(n.id, { ...n });
 		if (n.contribution !== null && n.contribution !== undefined) {
-			state.maxAbs = Math.max(state.maxAbs, Math.abs(n.contribution));
+			graphState.maxAbs = Math.max(graphState.maxAbs, Math.abs(n.contribution));
 		}
 	}
 	for (const e of graph.edges) {
-		state.edges.set(`${e.source}->${e.target}`, { ...e });
+		graphState.edges.set(`${e.source}->${e.target}`, { ...e });
 	}
 	// Belt and braces for the final view: any branch that reaches an embedding
 	// stays coral after the search, whatever the server-side flags say.
-	for (const n of state.nodes.values()) {
-		if (n.kind === "embed") markCompleteUp(n.id);
+	for (const n of graphState.nodes.values()) {
+		if (n.kind === "embed") markCompleteUp(n.id, graphState);
 	}
-	scheduleRender();
+	if (shouldRender) scheduleRender();
 }
 
 /* --------------------------------------------------------------- geometry */
@@ -396,7 +433,7 @@ function render() {
 			attrs.stroke = "var(--accent)";
 			attrs["stroke-width"] = 2.2 + Math.min(2.4, Math.log2(e.count + 1));
 			attrs.opacity = 0.85;
-		} else if (state.running) {
+		} else if (state.displayingLiveRun) {
 			attrs.stroke = "var(--accent)";
 			attrs["stroke-width"] = 1.4;
 			attrs.opacity = 0.45;
@@ -406,9 +443,9 @@ function render() {
 			attrs["stroke-dasharray"] = "3 4";
 			attrs.opacity = 0.55;
 		}
-		if (state.running) attrs.class += " searching";
+		if (state.displayingLiveRun) attrs.class += " searching";
 		const p = el("path", attrs, gE);
-		if (state.running) {
+		if (state.displayingLiveRun) {
 			// Keep the dash phase continuous across re-renders.
 			p.style.animationDelay = `-${((performance.now() / 1000) % 0.9).toFixed(3)}s`;
 		}
@@ -612,21 +649,35 @@ async function loadConfig() {
 }
 
 const tokenizePreview = debounce(async () => {
+	if (state.result || state.displayingLiveRun
+		|| (state.activeJob?.method === state.method && state.activeJob.displayActive)) return;
+	const method = state.method;
 	const prompt = lines($("#prompts").value)[0];
 	if (!prompt) return;
+	const model = $("#model").value;
+	const positional = $("#positional").checked;
+	const version = ++state.previewVersion;
 	$("#empty-state").textContent = "Tokenizing (first call loads the model)…";
 	$("#empty-state").style.display = "flex";
 	try {
-		const out = await api("/api/tokenize", { model: $("#model").value, prompt });
+		const out = await api("/api/tokenize", { model, prompt });
+		if (version !== state.previewVersion || state.result || state.displayingLiveRun
+			|| state.method !== method || lines($("#prompts").value)[0] !== prompt
+			|| $("#model").value !== model || $("#positional").checked !== positional
+			|| (state.activeJob?.method === method && state.activeJob.displayActive)) return;
 		state.meta = {
 			tokens: out.tokens,
 			n_layers: out.n_layers,
 			n_heads: out.n_heads,
-			positional: $("#positional").checked,
-			layout: state.method === "acdc" ? "head" : "position",
+			positional,
+			layout: method === "acdc" ? "head" : "position",
 		};
 		scheduleRender();
 	} catch (e) {
+		if (version !== state.previewVersion || state.method !== method
+			|| state.result || state.displayingLiveRun
+			|| lines($("#prompts").value)[0] !== prompt || $("#model").value !== model
+			|| (state.activeJob?.method === method && state.activeJob.displayActive)) return;
 		$("#empty-state").textContent = `Tokenize failed: ${e.message}`;
 	}
 }, 600);
@@ -637,16 +688,28 @@ function setRunning(on) {
 	state.running = on;
 	$("#run").disabled = on;
 	$("#cancel").hidden = !on;
-	$("#status").hidden = false;
+	refreshMethodStatus();
 }
 
-function setStatus(msg) {
-	$("#status-msg").textContent = msg;
+function setStatus(msg, method = state.method) {
+	state.methodStatus[method] = msg;
+	if (method === state.method) refreshMethodStatus();
 }
 
-function setProgress(frac, txt) {
-	$("#progress-fill").style.width = `${Math.round(frac * 100)}%`;
-	$("#progress-txt").textContent = txt;
+function setProgress(frac, txt, method = state.method) {
+	state.methodProgress[method] = { frac, text: txt };
+	if (method === state.method) refreshMethodStatus();
+}
+
+function refreshMethodStatus() {
+	const method = state.method;
+	const status = state.methodStatus[method];
+	const progress = state.methodProgress[method];
+	const runningHere = state.running && state.activeJob?.method === method;
+	$("#status").hidden = status === null && !runningHere;
+	$("#status-msg").textContent = status || "";
+	$("#progress-fill").style.width = `${Math.round((progress?.frac ?? 0) * 100)}%`;
+	$("#progress-txt").textContent = progress?.text || "";
 }
 
 async function runSearch() {
@@ -703,22 +766,61 @@ async function runSearch() {
 }
 
 async function submit(body) {
+	state.previewVersion += 1;
+	const job = {
+		method: body.method,
+		params: JSON.parse(JSON.stringify(body)),
+		meta: null,
+		liveState: createLiveGraphState(),
+		completed: false,
+		displayActive: true,
+	};
+	state.activeJob = job;
 	setRunning(true);
-	setStatus("Submitting job…");
-	setProgress(0, "");
-	resetGraph();
+	setStatus("Submitting job…", job.method);
+	setProgress(0, "", job.method);
+	clearDisplay("Searching for a circuit…");
+	job.displayActive = true;
 
 	try {
 		const out = await api("/api/search", body);
+		if (state.activeJob !== job) return;
 		state.jobId = out.job_id;
-		openStream(out.job_id);
+		openStream(out.job_id, job);
 	} catch (e) {
-		setStatus(`Error: ${e.message}`);
+		if (state.activeJob !== job) return;
+		state.activeJob = null;
+		state.jobId = null;
+		setStatus(`Error: ${e.message}`, job.method);
 		setRunning(false);
+		if (state.method === job.method) restoreMethodResult(job.method);
 	}
 }
 
-function openStream(jobId) {
+function isDisplayedJob(job) {
+	return state.activeJob === job && job.displayActive && state.method === job.method;
+}
+
+function attachLiveGraph(job, restoreControls = false) {
+	const live = job.liveState;
+	drainAdmitQueue(live, live.admitQueue.length);
+	state.meta = live.meta ? { ...live.meta } : null;
+	state.nodes = live.nodes;
+	state.edges = live.edges;
+	state.maxAbs = live.maxAbs;
+	state.threshold = live.threshold;
+	state.admitQueue = live.admitQueue;
+	state.fresh = live.fresh;
+	state.result = null;
+	state.hover = null;
+	state.displayingLiveRun = Boolean(live.meta);
+	$("#summary").innerHTML = "";
+	$("#result-box").hidden = true;
+	if (restoreControls) restoreParams(job.params, job.method);
+	scheduleRender();
+}
+
+function openStream(jobId, job) {
 	if (state.es) state.es.close();
 	const es = new EventSource(`/api/search/${jobId}/events`);
 	state.es = es;
@@ -726,73 +828,205 @@ function openStream(jobId) {
 		const ev = JSON.parse(msg.data);
 		switch (ev.event) {
 			case "status":
-				setStatus(ev.message || ev.status);
+				setStatus(ev.message || ev.status, job.method);
 				break;
 			case "meta":
-				state.meta = {
+				job.meta = {
 					tokens: ev.tokens, n_layers: ev.n_layers,
 					n_heads: ev.n_heads, positional: ev.positional,
-					layout: ev.layout || "position",
+					layout: ev.layout || (job.method === "acdc" ? "head" : "position"),
 				};
-				setStatus("Searching…");
-				scheduleRender();
+				job.liveState.meta = { ...job.meta };
+				setStatus("Searching…", job.method);
+				if (isDisplayedJob(job)) {
+					attachLiveGraph(job);
+				}
 				break;
 			case "progress":
 				// ACDC: one event per pruning step, occasionally carrying a
 				// snapshot of the graph as it shrinks.
-				setProgress(ev.frac ?? 0, ev.text || "");
-				if (ev.message) setStatus(ev.message);
-				if (ev.graph) loadGraph(ev.graph);
+				setProgress(ev.frac ?? 0, ev.text || "", job.method);
+				if (ev.message) setStatus(ev.message, job.method);
+				if (ev.graph) loadGraph(ev.graph, job.liveState, isDisplayedJob(job));
 				break;
 			case "depth_start":
-				setProgress(0, `depth ${ev.depth} · frontier ${ev.frontier_size}`);
+				setProgress(0, `depth ${ev.depth} · frontier ${ev.frontier_size}`, job.method);
 				break;
 			case "leaf_done":
-				setProgress(ev.leaf / ev.n_leaves, `depth ${ev.depth} · leaf ${ev.leaf}/${ev.n_leaves}`);
+				setProgress(ev.leaf / ev.n_leaves, `depth ${ev.depth} · leaf ${ev.leaf}/${ev.n_leaves}`, job.method);
 				break;
 			case "depth_end":
-				setProgress(1, `depth ${ev.depth} done · admitted ${ev.admitted}`);
+				setProgress(1, `depth ${ev.depth} done · admitted ${ev.admitted}`, job.method);
 				break;
 			case "admit":
-				state.admitQueue.push(ev);
+				job.liveState.admitQueue.push(ev);
 				break;
 			case "path_complete":
+				const graphState = job.liveState;
 				for (const n of ev.path) {
-					mergeNode(n);
-					state.fresh.set(n.id, performance.now());
+					mergeNode(n, graphState);
+					graphState.fresh.set(n.id, performance.now());
 				}
 				for (let i = 0; i + 1 < ev.path.length; i++) {
 					mergeEdge(ev.path[i].id, ev.path[i + 1].id,
-						ev.path[i].contribution ?? ev.contribution, true);
+						ev.path[i].contribution ?? ev.contribution, true, graphState);
 				}
-				scheduleRender();
+				if (isDisplayedJob(job)) scheduleRender();
 				break;
 			case "result":
-				state.admitQueue.length = 0;
-				state.fresh.clear();
-				state.result = { graph: ev.graph, meta: ev.meta };
-				state.meta = { ...state.meta, ...ev.meta };
-				loadGraph(ev.graph);
-				showSummary(ev.meta);
-				setStatus(`Done in ${ev.meta.runtime}s.`);
+				job.completed = true;
+				const method = ev.meta.method || job.method;
+				const resultMeta = {
+					...(job.meta || {}),
+					...ev.meta,
+					method,
+					layout: ev.meta.layout || job.meta?.layout
+						|| (method === "acdc" ? "head" : "position"),
+				};
+				if (Object.prototype.hasOwnProperty.call(state.savedResults, method)) {
+					state.savedResults[method] = {
+						graph: ev.graph,
+						meta: resultMeta,
+						params: job.params,
+					};
+					state.drafts[method] = null;
+				}
+				if (state.method === method) restoreSavedResult(method);
+				setProgress(1, "", method);
+				setStatus(`Done in ${ev.meta.runtime}s.`, method);
 				break;
 			case "end":
 				es.close();
-				state.es = null;
-				setRunning(false);
-				scheduleRender();  // strip the pumping animation
-				if (ev.status !== "complete") setStatus(`Search ${ev.status}.`);
+				if (!job.completed && state.method === job.method) restoreMethodResult(job.method);
+				finishJob(job);
+				if (ev.status !== "complete") setStatus(`Search ${ev.status}.`, job.method);
 				break;
 		}
 	};
 	es.onerror = () => {
 		// The stream ends when the job does; report only if still running.
-		if (state.running) setStatus("Stream interrupted — check the server log.");
+		if (state.running) setStatus("Stream interrupted — check the server log.", job.method);
 		es.close();
-		state.es = null;
-		setRunning(false);
-		scheduleRender();
+		if (!job.completed && state.method === job.method) restoreMethodResult(job.method);
+		finishJob(job);
 	};
+}
+
+function finishJob(job) {
+	if (state.activeJob !== job) return;
+	state.activeJob = null;
+	state.jobId = null;
+	state.es = null;
+	state.displayingLiveRun = false;
+	setRunning(false);
+	scheduleRender();
+}
+
+function restoreMethodResult(method) {
+	const saved = state.savedResults[method];
+	if (saved) restoreSavedResult(method);
+	else clearDisplay("No completed circuit for this algorithm. Run discovery to create one.");
+}
+
+function restoreSavedResult(method) {
+	const saved = state.savedResults[method];
+	if (!saved) {
+		clearDisplay("No completed circuit for this algorithm. Run discovery to create one.");
+		return;
+	}
+	if (state.activeJob && state.activeJob.method === method) {
+		state.activeJob.displayActive = false;
+	}
+	state.drafts[method] = null;
+	state.method = method;
+	clearDisplay();
+	state.meta = { ...saved.meta };
+	loadGraph(saved.graph);
+	state.result = { graph: saved.graph, meta: saved.meta };
+	restoreParams(saved.params, method);
+	showSummary(saved.meta);
+	scheduleRender();
+}
+
+function captureFormState() {
+	return {
+		model: $("#model").value,
+		prompts: $("#prompts").value,
+		targets: $("#targets").value,
+		cf_prompts: $("#cf-prompts").value,
+		cf_targets: $("#cf-targets").value,
+		strategy: state.strategy,
+		mode: state.mode,
+		min_contribution: $("#min-contribution").value,
+		max_width: $("#max-width").value,
+		metric: $("#metric").value,
+		positional: $("#positional").checked,
+		include_negative: $("#include-negative").checked,
+		acdc_metric: $("#acdc-metric").value,
+		acdc_threshold: $("#acdc-threshold").value,
+		acdc_abs_threshold: $("#acdc-abs-threshold").checked,
+	};
+}
+
+function restoreDraft(draft, method) {
+	applyFormState(draft, method);
+}
+
+function restoreParams(params, method) {
+	if (!params) return;
+	applyFormState({
+		...params,
+		prompts: (params.prompts || []).join("\n"),
+		targets: (params.targets || []).join("\n"),
+		cf_prompts: (params.cf_prompts || []).join("\n"),
+		cf_targets: (params.cf_targets || []).join("\n"),
+	}, method);
+}
+
+function resetFormToDefaults(method) {
+	applyFormState({
+		model: state.config?.models?.[0] ?? $("#model").options[0]?.value ?? "",
+		prompts: "",
+		targets: "",
+		cf_prompts: "",
+		cf_targets: "",
+		strategy: "threshold",
+		mode: "noising",
+		min_contribution: "0.05",
+		max_width: "20",
+		metric: state.config?.metrics?.[0] ?? $("#metric").options[0]?.value ?? "",
+		positional: true,
+		include_negative: true,
+		acdc_metric: state.config?.acdc_metrics?.[0] ?? $("#acdc-metric").options[0]?.value ?? "",
+		acdc_threshold: "0.0575",
+		acdc_abs_threshold: false,
+	}, method);
+}
+
+function applyFormState(values, method) {
+	$("#model").value = values.model || state.config?.models?.[0] || $("#model").options[0]?.value || "";
+	$("#prompts").value = values.prompts ?? "";
+	$("#targets").value = values.targets ?? "";
+	$("#cf-prompts").value = values.cf_prompts ?? "";
+	$("#cf-targets").value = values.cf_targets ?? "";
+	$("#min-contribution").value = values.min_contribution ?? "0.05";
+	$("#max-width").value = values.max_width ?? "20";
+	$("#metric").value = values.metric || state.config?.metrics?.[0] || $("#metric").options[0]?.value || "";
+	$("#positional").checked = values.positional ?? true;
+	$("#include-negative").checked = values.include_negative ?? true;
+	$("#acdc-metric").value = values.acdc_metric || state.config?.acdc_metrics?.[0]
+		|| $("#acdc-metric").options[0]?.value || "";
+	$("#acdc-threshold").value = values.acdc_threshold ?? "0.0575";
+	$("#acdc-abs-threshold").checked = values.acdc_abs_threshold ?? false;
+	state.method = method;
+	state.strategy = values.strategy ?? "threshold";
+	state.mode = values.mode ?? "noising";
+	setSegValue("#method-seg", state.method);
+	setSegValue("#strategy-seg", state.strategy);
+	setSegValue("#mode-seg", state.mode);
+	applyMethod();
+	updateStrategyFields();
+	updateModeHint();
 }
 
 function showSummary(meta) {
@@ -836,6 +1070,48 @@ function updateModeHint() {
 	}
 }
 
+function setSegValue(id, value) {
+	$(id).querySelectorAll("button").forEach((button) => {
+		button.classList.toggle("on", button.dataset.value === value);
+	});
+}
+
+function updateStrategyFields() {
+	$("#min-contribution-field").hidden = state.strategy !== "threshold";
+	$("#max-width-field").hidden = state.strategy !== "topk";
+}
+
+function selectMethod(method) {
+	if (method === state.method) return;
+	state.previewVersion += 1;
+	const previousMethod = state.method;
+	state.drafts[previousMethod] = state.savedResults[previousMethod]
+		? null
+		: captureFormState();
+	const liveJob = state.activeJob && !state.activeJob.completed
+		&& state.activeJob.method === method
+		? state.activeJob
+		: null;
+	if (state.activeJob) state.activeJob.displayActive = false;
+	state.method = method;
+	if (liveJob) {
+		clearDisplay("Search in progress…");
+		liveJob.displayActive = true;
+		attachLiveGraph(liveJob, true);
+	} else if (state.savedResults[method]) {
+		restoreSavedResult(method);
+	} else {
+		clearDisplay("No completed circuit for this algorithm. Run discovery to create one.");
+		if (state.drafts[method]) {
+			restoreDraft(state.drafts[method], method);
+			if (lines($("#prompts").value)[0]) tokenizePreview();
+		} else {
+			resetFormToDefaults(method);
+		}
+	}
+	refreshMethodStatus();
+}
+
 /* Show only the knobs the selected algorithm actually reads. ACDC ignores the
  * IPE strategy / patching direction / positional switches entirely: it has one
  * threshold, one metric and one (position-agnostic) pruning pass. */
@@ -856,11 +1132,6 @@ function applyMethod() {
 			? "grow one suffix-sharing tree of message paths back from the logits"
 			: "score complete root→embedding paths independently";
 	}
-	// Reshape the (possibly empty) preview grid to match: ACDC is drawn by head.
-	if (state.meta) {
-		state.meta.layout = acdc ? "head" : "position";
-		scheduleRender();
-	}
 }
 
 function setupSeg(id, onChange) {
@@ -878,11 +1149,10 @@ function init() {
 	loadConfig().catch((e) => setStatus(`Config failed: ${e.message}`));
 	setupPanZoom();
 
-	setupSeg("#method-seg", (v) => { state.method = v; applyMethod(); });
+	setupSeg("#method-seg", selectMethod);
 	setupSeg("#strategy-seg", (v) => {
 		state.strategy = v;
-		$("#min-contribution-field").hidden = v !== "threshold";
-		$("#max-width-field").hidden = v !== "topk";
+		updateStrategyFields();
 	});
 	setupSeg("#mode-seg", (v) => { state.mode = v; updateModeHint(); });
 	$("#metric").addEventListener("change", updateModeHint);
@@ -892,13 +1162,16 @@ function init() {
 	$("#cf-prompts").addEventListener("input", applyMethod);
 	$("#model").addEventListener("change", tokenizePreview);
 	$("#positional").addEventListener("change", () => {
-		if (state.meta) { state.meta.positional = $("#positional").checked; scheduleRender(); }
+		if (!state.result && !state.displayingLiveRun && state.meta) {
+			state.meta.positional = $("#positional").checked;
+			scheduleRender();
+		}
 	});
 
 	$("#run").addEventListener("click", runSearch);
 	$("#cancel").addEventListener("click", async () => {
 		if (state.jobId) {
-			setStatus("Cancelling…");
+			setStatus("Cancelling…", state.activeJob?.method || state.method);
 			await api(`/api/search/${state.jobId}/cancel`, {});
 		}
 	});

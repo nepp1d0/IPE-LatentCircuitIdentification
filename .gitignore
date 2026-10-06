@@ -12,3 +12,4 @@ temp.py
 various_tests.ipynb
 *.vscode
 ./local/*
+.venv
