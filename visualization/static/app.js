@@ -97,6 +97,24 @@ function fmt(c) {
 	return (c >= 0 ? "+" : "") + c.toFixed(4);
 }
 
+function escapeHtml(value) {
+	return String(value).replace(/[&<>"']/g, (ch) => ({
+		"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+	})[ch]);
+}
+
+function visibleToken(token) {
+	return String(token).replace(/\r\n?/g, "\n").replace(/ /g, "␠")
+		.replace(/\t/g, "⇥").replace(/\n/g, "↵");
+}
+
+function fmtProbability(probability) {
+	if (probability === null || probability === undefined) return "N/A";
+	const value = Number(probability);
+	if (!Number.isFinite(value)) return "N/A";
+	return value !== 0 && Math.abs(value) < 0.0001 ? value.toExponential(3) : value.toFixed(5);
+}
+
 function nodeLabel(n) {
 	if (n.kind === "final") return "FINAL";
 	if (n.kind === "embed") return "EMB";
@@ -178,6 +196,9 @@ function mergeNode(d, graphState = state) {
 		});
 	} else {
 		cur.merged += 1;
+		if (d.component_logit_lens?.available || !cur.component_logit_lens) {
+			cur.component_logit_lens = d.component_logit_lens;
+		}
 		if (d.contribution !== null && d.contribution !== undefined) {
 			if (cur.contribution === null || cur.contribution === undefined
 				|| Math.abs(d.contribution) > Math.abs(cur.contribution)) {
@@ -234,11 +255,17 @@ function markCompleteUp(startId, graphState = state) {
 }
 
 function loadGraph(graph, graphState = state, shouldRender = true) {
+	const previousNodes = new Map(graphState.nodes);
 	graphState.nodes.clear();
 	graphState.edges.clear();
 	graphState.maxAbs = 0;
 	for (const n of graph.nodes) {
-		graphState.nodes.set(n.id, { ...n });
+		const previousLens = previousNodes.get(n.id)?.component_logit_lens;
+		graphState.nodes.set(n.id, {
+			...n,
+			component_logit_lens: n.component_logit_lens?.available
+				? n.component_logit_lens : previousLens || n.component_logit_lens,
+		});
 		if (n.contribution !== null && n.contribution !== undefined) {
 			graphState.maxAbs = Math.max(graphState.maxAbs, Math.abs(n.contribution));
 		}
@@ -414,7 +441,7 @@ function render() {
 			const t = el("text", { x: x + cw / 2, y: y + h / 2 }, g);
 			t.textContent = (cw < 34 && label.length > 4) ? label.replace(/^A/, "").replace("MLP", "M") : label;
 			g.addEventListener("mouseenter", (ev) => onHoverNode(n, ev));
-			g.addEventListener("mousemove", moveTooltip);
+			g.addEventListener("mousemove", (ev) => onHoverNode(n, ev));
 			g.addEventListener("mouseleave", clearHover);
 		});
 	}
@@ -504,12 +531,13 @@ function applyHighlight() {
 }
 
 function onHoverNode(n, ev) {
+	n = state.nodes.get(n.id) || n;
 	state.hover = relatedSet(n.id);
 	applyHighlight();
 	const tokens = state.meta ? state.meta.tokens : [];
-	const rowsOut = [`<div class="tt-title">${nodeLabel(n)}</div>`];
+	const rowsOut = [`<div class="tt-title">${escapeHtml(nodeLabel(n))}</div>`];
 	if (n.position !== null && n.position !== undefined) {
-		rowsOut.push(`position ${n.position} <span class="tt-dim">${JSON.stringify(tokens[n.position] ?? "")}</span>`);
+		rowsOut.push(`position ${escapeHtml(n.position)} <span class="tt-dim">${escapeHtml(visibleToken(tokens[n.position] ?? ""))}</span>`);
 	} else {
 		rowsOut.push(`<span class="tt-dim">position-agnostic</span>`);
 	}
@@ -518,12 +546,24 @@ function onHoverNode(n, ev) {
 		rowsOut.push(`<span class="tt-dim">zero isolated effect — the clean and counterfactual
 			embeddings are identical at this position, so patching it does nothing</span>`);
 	}
-	if (n.variants && n.variants.length) rowsOut.push(`patched streams: ${n.variants.join(", ")}`);
+	if (n.variants && n.variants.length) rowsOut.push(`patched streams: ${escapeHtml(n.variants.join(", "))}`);
 	if (n.kv_positions && n.kv_positions.length) {
-		rowsOut.push(`K/V read at: ${n.kv_positions.map((p) => `${p} ${JSON.stringify((tokens[p] ?? "").trim())}`).join(", ")}`);
+		rowsOut.push(`K/V read at: ${n.kv_positions.map((p) => `${escapeHtml(p)} ${escapeHtml(visibleToken(tokens[p] ?? ""))}`).join(", ")}`);
 	}
-	if (n.merged > 1 && !byHead()) rowsOut.push(`<span class="tt-dim">${n.merged} tree nodes merged</span>`);
+	if (n.merged > 1 && !byHead()) rowsOut.push(`<span class="tt-dim">${escapeHtml(n.merged)} tree nodes merged</span>`);
 	if (n.complete === false) rowsOut.push(`<span class="tt-dim">on a pruned branch (never reached EMB)</span>`);
+	if (n.kind === "mlp" || n.kind === "attn") {
+		const lens = n.component_logit_lens;
+		rowsOut.push(`<br><div class="tt-title">Component Logit Lens (Top 5 Tokens)</div>`);
+		if (!lens || lens.available !== true) {
+			rowsOut.push(`<span class="tt-dim">Readout unavailable for this component.</span>`);
+		} else {
+			for (const [index, item] of (lens.top_tokens || []).entries()) {
+				const rank = Number.isInteger(item.rank) ? item.rank : index + 1;
+				rowsOut.push(`${rank}. <code>${escapeHtml(visibleToken(item.token ?? ""))}</code>: <b>${escapeHtml(fmtProbability(item.probability))}</b>`);
+			}
+		}
+	}
 	showTooltip(rowsOut.join("<br>"), ev);
 }
 
@@ -531,7 +571,7 @@ function onHoverEdge(e, ev) {
 	state.hover = { nodes: new Set([e.source, e.target]), edges: new Set([`${e.source}->${e.target}`]) };
 	applyHighlight();
 	const s = state.nodes.get(e.source), t = state.nodes.get(e.target);
-	const rows = [`<div class="tt-title">${s ? nodeLabel(s) : e.source} &rarr; ${t ? nodeLabel(t) : e.target}</div>`];
+	const rows = [`<div class="tt-title">${escapeHtml(s ? nodeLabel(s) : e.source)} &rarr; ${escapeHtml(t ? nodeLabel(t) : e.target)}</div>`];
 	if (e.contribution !== null && e.contribution !== undefined) {
 		rows.push(byHead()
 			? `strongest effect of cutting it: <b>${fmt(e.contribution)}</b>`

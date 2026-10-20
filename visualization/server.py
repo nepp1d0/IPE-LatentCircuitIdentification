@@ -52,6 +52,7 @@ from ipe.graph_search import (
 	TreeMessagePatching_LimitedLevelWidth,
 )
 from ipe.webutils.serialization import graph_from_paths, graph_from_tree, node_to_dict
+from ipe.webutils.component_logit_lens import LiveComponentLogitLens
 from ipe.webutils import acdc_bridge
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -112,7 +113,13 @@ def _scrub(x):
 	if isinstance(x, float):
 		return x if math.isfinite(x) else None
 	if isinstance(x, dict):
-		return {k: _scrub(v) for k, v in x.items()}
+		clean = {k: _scrub(v) for k, v in x.items()}
+		lens = clean.get("component_logit_lens")
+		if isinstance(lens, dict) and any(
+			item.get("probability") is None for item in lens.get("top_tokens", [])
+		):
+			clean["component_logit_lens"] = {"available": False}
+		return clean
 	if isinstance(x, (list, tuple)):
 		return [_scrub(v) for v in x]
 	return x
@@ -277,12 +284,18 @@ def _run_acdc(job: Job, req: SearchRequest) -> None:
 			if "graph" not in event and now - last_emit < 0.2:
 				return
 			last_emit = now
+		if "graph" in event:
+			lens.enrich(event["graph"])
 		job.push(event)
 
 	with _run_lock:
 		job.status = "running"
 		job.push({"event": "status", "status": "running", "message": f"Loading {req.model}..."})
 		model = get_model(req.model)
+		job.push({"event": "status", "status": "running", "message": "Preparing live component readouts..."})
+		lens = LiveComponentLogitLens(model, req.prompts[0])
+		if job.cancel_requested:
+			raise SearchCancelled()
 
 		tokens = model.to_str_tokens(req.prompts[0], prepend_bos=True)
 		job.push({"event": "meta", "tokens": tokens,
@@ -297,6 +310,10 @@ def _run_acdc(job: Job, req: SearchRequest) -> None:
 			abs_value_threshold=req.acdc_abs_threshold,
 			on_event=on_event,
 		)
+		job.push({"event": "status", "status": "running",
+				  "message": "Decoding discovered components from the clean prompt..."})
+		lens.enrich(graph, final=True)
+		del lens
 
 		job.result = _scrub({
 			"graph": graph,
@@ -343,18 +360,23 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 			last_leaf_emit = now
 			job.push(event)
 		elif kind == "admit":
+			node = node_to_dict(event["node"])
+			parent = node_to_dict(event["parent"])
+			lens.enrich({"nodes": [node, parent]})
 			job.push({
 				"event": "admit",
 				"depth": event["depth"],
-				"node": node_to_dict(event["node"]),
-				"parent": node_to_dict(event["parent"]),
+				"node": node,
+				"parent": parent,
 				"contribution": event["contribution"],
 			})
 		elif kind == "path_complete":
+			path = [node_to_dict(n) for n in event["path"]]
+			lens.enrich({"nodes": path})
 			job.push({
 				"event": "path_complete",
 				"depth": event["depth"],
-				"path": [node_to_dict(n) for n in event["path"]],
+				"path": path,
 				"contribution": event["contribution"],
 			})
 		else:  # depth_start / depth_end
@@ -399,6 +421,10 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 			)
 			metric = experiment.metric
 			root = experiment.root
+			job.push({"event": "status", "status": "running", "message": "Preparing live component readouts..."})
+			lens = LiveComponentLogitLens(model, req.prompts[0], experiment.cache)
+			if job.cancel_requested:
+				raise SearchCancelled()
 
 			tokens = model.to_str_tokens(req.prompts[0], prepend_bos=True)
 			job.push({"event": "meta", "tokens": tokens,
@@ -425,6 +451,10 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 				graph = graph_from_paths(paths)
 				joint = None
 			runtime = time.time() - t0
+			job.push({"event": "status", "status": "running",
+					  "message": "Decoding discovered components from the clean prompt..."})
+			lens.enrich(graph, final=True)
+			del lens
 
 			job.result = _scrub({
 				"graph": graph,
