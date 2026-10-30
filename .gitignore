@@ -13,3 +13,4 @@ various_tests.ipynb
 *.vscode
 ./local/*
 .venv
+environment.yml
