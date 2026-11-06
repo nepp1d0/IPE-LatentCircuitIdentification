@@ -387,6 +387,7 @@ def TreeMessagePatching(
 		)
 		frontier = [root]
 		depth = 0
+		admission_index = 0
 		while frontier:
 			# Each candidate is scored in isolation (its own branch contribution),
 			# so survivors can be attached immediately without affecting any other
@@ -419,6 +420,8 @@ def TreeMessagePatching(
 					)
 					if admitted:
 						candidate.contribution = float(score)
+						candidate.discovery_index = admission_index
+						admission_index += 1
 						survivors.append(candidate)
 						leaf.children.add(candidate)
 						if candidate.__class__.__name__ != 'EMBED_Node':
@@ -496,6 +499,7 @@ def TreeMessagePatching_LimitedLevelWidth(
 		)
 		frontier = [root]
 		depth = 0
+		admission_index = 0
 		while frontier:
 			_tlog.debug(f"--- depth {depth} --- frontier_size={len(frontier)}")
 			_emit(on_event, {"event": "depth_start", "depth": depth, "frontier_size": len(frontier)})
@@ -525,6 +529,8 @@ def TreeMessagePatching_LimitedLevelWidth(
 			survivors = heapq.nlargest(max_width, scored, key=lambda x: x[0])
 			next_frontier = []
 			for _, leaf, candidate in survivors:
+				candidate.discovery_index = admission_index
+				admission_index += 1
 				leaf.children.add(candidate)
 				if candidate.__class__.__name__ != 'EMBED_Node':
 					next_frontier.append(candidate)
@@ -634,6 +640,7 @@ def PathMessagePatching(
 						contribution = evaluate_path([candidate] + incomplete_path, metric)
 						if return_all or (contribution >= min_contribution) or (include_negative and abs(contribution) >= min_contribution):
 							candidate.contribution = float(contribution)
+							candidate.discovery_index = len(completed_paths)
 							completed_paths.append((contribution, [candidate] + incomplete_path))
 							_emit(on_event, {"event": "path_complete", "depth": depth,
 											 "path": [candidate] + incomplete_path,
@@ -869,6 +876,7 @@ def PathMessagePatching_LimitedLevelWidth(
 						# (identical clean/cf embedding) carries no information.
 						if (include_negative or contribution >= 0) and float(contribution) != 0:
 							candidate.contribution = float(contribution)
+							candidate.discovery_index = len(completed_paths)
 							completed_paths.append((contribution, [candidate] + path))
 							_emit(on_event, {"event": "path_complete", "depth": depth,
 											 "path": [candidate] + path,

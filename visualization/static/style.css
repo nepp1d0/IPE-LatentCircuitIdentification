@@ -15,6 +15,7 @@
 	--pos: #5A92BF;           /* diverging pole: positive contribution */
 	--neg: #BF4D43;           /* diverging pole: negative contribution */
 	--mid: #E8E6DC;           /* neutral diverging midpoint */
+	--path-alternative: #B4B2AA;
 }
 @media (prefers-color-scheme: dark) {
 	:root {
@@ -31,11 +32,14 @@
 		--pos: #7FB0DC;
 		--neg: #CE5B4E;
 		--mid: #3A3935;
+		--path-alternative: #99978F;
 	}
 }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+/* Opening/clearing a stacked Inspector must not add/remove viewport width. */
+html { scrollbar-gutter: stable; }
 body {
 	font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 	font-size: 13px;
@@ -45,7 +49,8 @@ body {
 
 #app {
 	display: grid;
-	grid-template: "topbar topbar" 52px "sidebar main" 1fr / 330px 1fr;
+	--path-inspector-width: 480px;
+	grid-template: "topbar topbar" 52px "sidebar main" minmax(0, 1fr) / 330px minmax(0, 1fr);
 	height: 100vh;
 }
 
@@ -184,6 +189,112 @@ button.primary:disabled { opacity: 0.5; cursor: default; }
 #summary b { color: var(--ink-1); }
 input[type="range"] { width: 100%; accent-color: var(--accent); }
 
+/* The third column exists only during node exploration; the default layout
+ * and SVG view transform are otherwise untouched. */
+#app.exploring-paths {
+	grid-template: "topbar topbar topbar" 52px "sidebar main paths" minmax(0, 1fr)
+		/ 330px minmax(0, 1fr) clamp(340px, var(--path-inspector-width), min(720px, calc(100vw - 650px)));
+}
+#path-explorer {
+	grid-area: paths;
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	padding: 14px;
+	border-left: 1px solid var(--grid-hair);
+	background: var(--surface-1);
+	font-size: 12px;
+	line-height: 1.5;
+}
+.path-inspector-header { flex: none; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid var(--grid-hair); }
+.path-heading-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content; align-items: start; gap: 10px; }
+#path-heading { min-width: 0; font-family: ui-serif, Georgia, serif; font-size: 17px; line-height: 1.35; font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.path-header-actions { display: flex; align-items: center; align-self: start; gap: 8px; flex: none; }
+#path-node { margin-top: 4px; font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
+#path-count { margin-top: 10px; overflow-wrap: anywhere; }
+#path-count strong { font-weight: 600; }
+.path-incomplete-count { font-size: 11px; color: var(--ink-muted); }
+#path-count strong, .path-incomplete-count { line-height: 1; }
+#path-legend-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.path-exploration-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 11px; color: var(--ink-2); }
+.path-exploration-legend > span { display: inline-flex; align-items: center; gap: 6px; }
+.path-line-sample { width: 22px; height: 0; border-top: 3px solid var(--accent); border-radius: 2px; }
+.path-line-sample.alternative { border-top: 2px solid var(--path-alternative); }
+#path-help { margin: 8px 0 0; font-size: 11px; }
+#path-info-wrap { position: relative; }
+#path-info-wrap::after { content: ""; position: absolute; top: 100%; right: 0; width: 100%; height: 8px; }
+#path-info-wrap #path-info-popover { top: calc(100% + 8px); right: 0; width: 310px; max-width: calc(100vw - 32px); max-height: min(360px, 70vh); overflow-y: auto; }
+#path-info-popover ul { padding-left: 16px; margin: 6px 0 0; }
+#path-info-popover li + li { margin-top: 5px; }
+#path-info-popover .path-info-note { margin: 8px 0 0; font-size: 11px; color: var(--ink-2); }
+#path-sort-wrap { position: relative; flex: none; }
+#path-explorer #path-sort-toggle { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px; font-size: 11px; background: transparent; color: var(--ink-2); }
+#path-sort-current { font-size: 10px; }
+#path-sort-popover { position: absolute; top: calc(100% + 6px); right: 0; z-index: 8; width: 272px; max-width: calc(100vw - 48px);
+	padding: 10px; border: 1px solid var(--grid-hair); border-radius: 8px; background: var(--surface-1); box-shadow: 0 6px 20px var(--border); }
+#path-explorer .path-sort-option { display: grid; grid-template-columns: 14px minmax(0, 1fr); align-items: center; gap: 6px;
+	width: 100%; padding: 6px; border-color: transparent; background: transparent; text-align: left; font-size: 11px; }
+.path-sort-option strong, .path-sort-option small { display: block; }
+.path-sort-option strong { font-weight: 600; }
+.path-sort-option small { margin-top: 2px; font-size: 10px; color: var(--ink-2); }
+.path-sort-check { visibility: hidden; color: var(--accent); }
+.path-sort-option[aria-checked="true"] .path-sort-check { visibility: visible; }
+#path-explorer .path-sort-option:hover, #path-explorer .path-sort-option:focus-visible { background: var(--page); }
+#path-sort-popover p { margin: 6px 0 0; font-size: 10px; color: var(--ink-2); }
+#path-score-context { flex: none; margin: 0 3px 8px; font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
+#path-resize-handle { position: absolute; inset: 0 auto 0 -5px; width: 10px; cursor: col-resize; touch-action: none; z-index: 6; }
+#path-resize-handle::after { content: ""; position: absolute; inset: 0 4px; background: transparent; transition: background 0.12s; }
+#path-resize-handle:hover::after, #path-resize-handle:focus-visible::after,
+.resizing-path-inspector #path-resize-handle::after { background: var(--accent); }
+#app.resizing-path-inspector, #app.resizing-path-inspector * { cursor: col-resize !important; user-select: none; }
+#path-list { display: flex; flex: 1 1 45%; flex-direction: column; gap: 6px; min-height: 80px; overflow-y: auto; scrollbar-gutter: stable; padding: 3px; }
+#path-explorer button {
+	font: inherit;
+	padding: 7px 8px;
+	border: 1px solid var(--grid-hair);
+	border-radius: 6px;
+	background: var(--page);
+	color: var(--ink-1);
+	cursor: pointer;
+}
+#path-explorer #path-clear { flex: none; width: 40px; height: 24px; padding: 2px 4px; border-color: transparent; background: transparent; font-size: 11px; color: var(--ink-2); }
+#path-explorer #path-clear:hover { color: var(--ink-1); text-decoration: underline; }
+#path-explorer #path-info { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border-radius: 50%; font: italic 13px ui-serif, Georgia, serif; background: transparent; color: var(--ink-2); }
+#path-explorer #path-info:hover, #path-explorer #path-info[aria-expanded="true"] { color: var(--ink-1); border-color: var(--baseline); background: var(--page); }
+#path-list .path-entry { flex: none; }
+#path-list .path-select {
+	flex: none;
+	width: 100%;
+	text-align: left;
+	overflow-wrap: anywhere;
+	border-left: 3px solid var(--baseline);
+}
+#path-list .path-select[aria-pressed="true"] { border-color: var(--accent); border-left-color: var(--accent); }
+#path-list .path-select:focus-visible, #path-clear:focus-visible, #path-info:focus-visible, #path-resize-handle:focus-visible,
+#selected-path-diagram:focus-visible, #path-sort-toggle:focus-visible, .path-sort-option:focus-visible,
+.path-difference-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.path-card-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.path-card-heading strong { font-weight: 600; }
+.path-score { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.path-card-summary { display: block; margin-top: 4px; font-size: 11px; font-weight: 400; }
+.path-card-summary > span { display: block; }
+.path-route-note { display: block; font-size: 10px; color: var(--ink-2); font-weight: 400; margin-top: 4px; }
+.path-difference-details { font-size: 11px; padding: 3px 6px; }
+.path-difference-details summary { cursor: pointer; color: var(--ink-2); }
+.path-difference-details ul { padding-left: 16px; overflow-wrap: anywhere; }
+#selected-path-details { display: flex; flex: 1 1 55%; flex-direction: column; min-height: 160px;
+	border-top: 1px solid var(--grid-hair); margin-top: 10px; padding-top: 8px; }
+#selected-path-heading { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+#selected-path-meta { font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
+#selected-path-diagram { overflow: auto; min-height: 0; margin-top: 6px; overscroll-behavior: contain; }
+#selected-path-diagram svg { display: block; }
+.path-component-name { font-size: 12px; font-weight: 600; fill: var(--ink-1); }
+.path-component-meta { font-size: 10px; fill: var(--ink-2); }
+.path-component-token { fill: var(--ink-muted); font-weight: 400; }
+.path-token-context { margin: 0 0 6px; color: var(--ink-2); font-size: 10px; }
+
 /* ---------------------------------------------------------------- legend */
 #legend .legend-row {
 	display: flex;
@@ -223,6 +334,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 /* ------------------------------------------------------------------ main */
 #canvas-wrap {
 	grid-area: main;
+	min-width: 0;
+	min-height: 0;
 	position: relative;
 	overflow: hidden;
 	background: var(--page);
@@ -287,6 +400,16 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 }
 .edge.dim { opacity: 0.05 !important; }
 .edge.hot { opacity: 1 !important; }
+.path-stroke {
+	fill: none;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+	pointer-events: none;
+}
+.path-hit { fill: none; stroke: transparent; stroke-linecap: round; pointer-events: stroke; cursor: pointer; }
+#grid.exploring-paths .edge.dim { opacity: 0.12 !important; }
+#grid.exploring-paths .chip.dim { opacity: 0.4; }
+.chip.hovered > rect, .chip:focus > rect { stroke-width: 2; }
 /* While the search runs, edges pulse coral dashes travelling from the root
  * (top) toward the leaves; phase is kept continuous across re-renders via an
  * inline negative animation-delay. */
@@ -318,7 +441,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 }
 
 /* ---------------------------------------------------------------- tooltip */
-#tooltip {
+#tooltip, #path-info-popover {
 	position: absolute;
 	max-width: 320px;
 	background: var(--surface-1);
@@ -328,12 +451,28 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 	padding: 8px 10px;
 	font-size: 12px;
 	line-height: 1.45;
-	pointer-events: none;
 	box-shadow: 0 4px 18px rgba(25, 25, 25, 0.14);
 	z-index: 10;
 }
+#tooltip { pointer-events: none; }
 #tooltip .tt-title {
 	font-family: ui-serif, Georgia, "Times New Roman", serif;
 	font-weight: 600;
 }
 #tooltip .tt-dim { color: var(--ink-2); }
+
+/* Stack the inspector below the graph when three usable columns no longer fit.
+ * Width preferences are kept for desktop, but cannot force mobile overflow. */
+@media (max-width: 1100px) {
+	/* Clear removes .exploring-paths; keep the parameter column the same size. */
+	#app { grid-template-columns: 280px minmax(0, 1fr); }
+	#app.exploring-paths { grid-template: "topbar topbar" 52px "sidebar main" minmax(280px, 1fr) "sidebar paths" minmax(300px, 1fr) / 280px minmax(0, 1fr); }
+	#path-explorer { border-left: none; border-top: 1px solid var(--grid-hair); }
+	#path-resize-handle { display: none; }
+}
+@media (max-width: 680px) {
+	#app, #app.exploring-paths { height: auto; min-height: 100vh; grid-template: "topbar" auto "sidebar" auto "main" 360px / minmax(0, 1fr); }
+	#app.exploring-paths { grid-template-rows: auto auto 360px minmax(500px, auto); grid-template-areas: "topbar" "sidebar" "main" "paths"; }
+	#topbar { flex-wrap: wrap; padding: 12px 16px; gap: 8px; }
+	#sidebar { min-width: 0; border-right: none; border-bottom: 1px solid var(--grid-hair); }
+}

@@ -42,6 +42,8 @@ const state = {
 	view: { x: 16, y: 8, k: 1 },
 	dirty: false,
 	hover: null,
+	pathExplorer: null,          // completed-result provenance; independent of hover/cache
+	pathEntries: new Map(),     // sidebar DOM references, separate from cached result data
 	admitQueue: [],          // incoming admit events, revealed one by one
 	fresh: new Map(),        // node id -> reveal timestamp (drives the pulse)
 };
@@ -125,6 +127,7 @@ function nodeLabel(n) {
 /* ------------------------------------------------------------ graph state */
 
 function clearDisplay(message = "Type a clean prompt to preview the model grid.") {
+	state.pathExplorer = null;
 	state.nodes = new Map();
 	state.edges = new Map();
 	state.admitQueue = [];
@@ -135,6 +138,7 @@ function clearDisplay(message = "Type a clean prompt to preview the model grid."
 	state.threshold = 0;
 	state.hover = null;
 	state.displayingLiveRun = false;
+	updatePathControls();
 	$("#threshold-slider").value = 0;
 	$("#threshold-val").textContent = "0";
 	$("#summary").innerHTML = "";
@@ -273,12 +277,204 @@ function loadGraph(graph, graphState = state, shouldRender = true) {
 	for (const e of graph.edges) {
 		graphState.edges.set(`${e.source}->${e.target}`, { ...e });
 	}
-	// Belt and braces for the final view: any branch that reaches an embedding
-	// stays coral after the search, whatever the server-side flags say.
-	for (const n of graphState.nodes.values()) {
-		if (n.kind === "embed") markCompleteUp(n.id, graphState);
+	if (!graph.path_provenance) {
+		for (const n of graphState.nodes.values()) {
+			if (n.kind === "embed") markCompleteUp(n.id, graphState);
+		}
 	}
 	if (shouldRender) scheduleRender();
+}
+
+/* -------------------------------------------------------- node exploration */
+
+function setPathInfoOpen(open, pinned = false) {
+	$("#path-info-popover").hidden = !open;
+	$("#path-info").setAttribute("aria-expanded", String(open));
+	$("#path-info").dataset.pinned = String(open && pinned);
+}
+
+function focusPathSortOption(option) {
+	for (const item of $("#path-sort").querySelectorAll("button")) item.tabIndex = item === option ? 0 : -1;
+	option?.focus({ preventScroll: true });
+}
+
+function setPathSortOpen(open, focusOption = false) {
+	$("#path-sort-popover").hidden = !open;
+	$("#path-sort-toggle").setAttribute("aria-expanded", String(open));
+	if (open) {
+		setPathInfoOpen(false);
+		if (focusOption) focusPathSortOption([...$("#path-sort").querySelectorAll("button")].find((n) => n.getAttribute("aria-checked") === "true"));
+	}
+}
+
+function updatePathHeader(explorer) {
+	const node = state.nodes.get(explorer.nodeId);
+	$("#path-heading").textContent = `Paths through ${node ? nodeLabel(node) : explorer.nodeId}`;
+	const metadata = [];
+	if (node) {
+		if (["attn", "mlp"].includes(node.kind) && node.layer != null) metadata.push(`Layer ${node.layer}`);
+		if (node.kind === "attn") metadata.push(node.head == null ? "All heads" : `Head ${node.head}`);
+		if (node.kind === "embed") metadata.push("Embedding");
+		if (node.kind === "final") metadata.push("Final residual");
+		metadata.push(node.position == null ? "All tokens" : `Token ${node.position}`);
+	}
+	$("#path-node").textContent = metadata.join(" · ") || "Component metadata unavailable";
+	const total = explorer.eligible.length;
+	const incomplete = explorer.index.incompleteByNode.get(explorer.nodeId) || 0;
+	const completeCount = document.createElement("strong");
+	completeCount.textContent = `${total} complete ${total === 1 ? "path" : "paths"}`;
+	const count = $("#path-count");
+	count.replaceChildren(completeCount);
+	if (incomplete) {
+		const excluded = document.createElement("span");
+		excluded.setAttribute("class", "path-incomplete-count");
+		excluded.textContent = ` · ${incomplete} incomplete ${incomplete === 1 ? "branch" : "branches"} excluded`;
+		count.appendChild(excluded);
+	}
+	$("#path-key").hidden = total === 0;
+	$("#path-help").hidden = total > 0;
+	$("#path-help").textContent = total ? "" : "No complete discovered paths pass through this node. The circuit is unchanged.";
+}
+
+function updatePathControls() {
+	const explorer = state.pathExplorer;
+	const active = Boolean(explorer?.active);
+	const hasPaths = active && explorer.eligible.length > 0;
+	$("#path-sort-toggle").disabled = !hasPaths;
+	const order = explorer?.sortOrder || "discovery";
+	for (const option of $("#path-sort").querySelectorAll("button")) {
+		option.disabled = !hasPaths;
+		option.setAttribute("aria-checked", String(option.value === order));
+	}
+	const orderLabel = { discovery: "Discovery", signed: "Signed", absolute: "Absolute" }[order];
+	$("#path-sort-current").textContent = orderLabel;
+	$("#path-sort-toggle").setAttribute("aria-label", `Sort paths. Current order: ${orderLabel}`);
+	$("#path-legend-row").hidden = !hasPaths;
+	$("#path-score-context").hidden = !hasPaths;
+	if (!hasPaths) setPathSortOpen(false);
+	$("#path-explorer").hidden = !active;
+	$("#app").classList.toggle("exploring-paths", active);
+	$("#threshold-slider").disabled = Boolean(hasPaths);
+	const list = $("#path-list");
+	list.replaceChildren();
+	state.pathEntries.clear();
+	if (!active) {
+		setPathInfoOpen(false);
+		updateSelectedPathDiagram(null);
+		return;
+	}
+	updatePathHeader(explorer);
+	const paths = explorer.listedPaths();
+	$("#path-score-context").textContent = PathPresentation.scoreContext(paths, state.result?.meta);
+	for (const path of paths) {
+		const row = document.createElement("div");
+		row.setAttribute("class", "path-entry");
+		row.dataset.pathId = path.id;
+		const button = document.createElement("button");
+		button.setAttribute("class", "path-select");
+		button.type = "button";
+		button.dataset.pathId = path.id;
+		button.addEventListener("click", () => selectPath(path.id));
+		const heading = document.createElement("span");
+		heading.setAttribute("class", "path-card-heading");
+		const number = document.createElement("strong");
+		number.textContent = `Path ${path.ordinal}`;
+		const score = document.createElement("strong");
+		score.setAttribute("class", "path-score");
+		score.textContent = PathPresentation.formatScore(path.score);
+		const presentation = PathExploration.scorePresentation(path, state.result?.meta);
+		score.title = presentation.tooltip;
+		score.setAttribute("aria-label", presentation.text);
+		heading.appendChild(number);
+		heading.appendChild(score);
+		const summary = document.createElement("span");
+		summary.setAttribute("class", "path-card-summary");
+		const note = document.createElement("small");
+		note.setAttribute("class", "path-route-note");
+		button.appendChild(heading);
+		button.appendChild(summary);
+		button.appendChild(note);
+		row.appendChild(button);
+		const details = document.createElement("details");
+		details.setAttribute("class", "path-difference-details");
+		const inspect = document.createElement("summary");
+		const changes = document.createElement("ul");
+		details.appendChild(inspect);
+		details.appendChild(changes);
+		row.appendChild(details);
+		list.appendChild(row);
+		state.pathEntries.set(path.id, { button, summary, note, details, inspect, changes });
+	}
+	list.scrollTop = 0;
+	updatePathSelectionControls();
+}
+
+function updateSelectedPathDiagram(path) {
+	$("#selected-path-details").hidden = !path;
+	$("#selected-path-meta").textContent = path ? `Path ${path.ordinal}` : "";
+	const diagram = $("#selected-path-diagram");
+	const changed = diagram.dataset.pathId !== (path?.id || "");
+	PathDiagram.render(diagram, path, {
+		name: PathExploration.componentName, variant: PathExploration.patchVariant,
+		meta: state.result?.meta,
+		occurrences: state.result?.graph?.path_provenance?.occurrences,
+	});
+	diagram.dataset.pathId = path?.id || "";
+	if (changed) diagram.scrollTop = 0;
+}
+
+function updatePathSelectionControls(scrollSelected = false) {
+	const explorer = state.pathExplorer;
+	const reference = explorer?.index.paths.get(explorer.selectedId);
+	const visibleDifferences = 4;
+	for (const [id, entry] of state.pathEntries) {
+		const path = explorer.index.paths.get(id);
+		const selected = id === reference?.id;
+		entry.button.setAttribute("aria-pressed", String(selected));
+		const comparison = PathExploration.comparePaths(reference, path);
+		const diffs = comparison.differences;
+		const labels = selected ? ["Selected reference"] : diffs.length ? diffs.slice(0, visibleDifferences).map(PathPresentation.differenceLabel)
+			: [comparison.metadataIncomplete ? "No differences in available metadata" : "Same components and patching"];
+		entry.summary.replaceChildren();
+		for (const label of labels) {
+			const line = document.createElement("span");
+			line.textContent = label;
+			entry.summary.appendChild(line);
+		}
+		const notes = [];
+		if (!selected && comparison.sameGeometry) notes.push(comparison.patchingOnly
+			? "Same route · different patching" : "Same route · distinct path");
+		if (comparison.metadataIncomplete) notes.push("Some intervention metadata unavailable");
+		const scoreNote = PathPresentation.scoreNote(path);
+		if (scoreNote) notes.push(scoreNote);
+		entry.note.textContent = notes.join(" · ");
+		entry.note.hidden = notes.length === 0;
+		entry.details.hidden = selected || diffs.length <= visibleDifferences;
+		entry.inspect.textContent = `Inspect remaining differences (${Math.max(0, diffs.length - visibleDifferences)} more)`;
+		entry.changes.replaceChildren();
+		for (const diff of diffs.slice(visibleDifferences)) {
+			const item = document.createElement("li");
+			item.dataset.type = diff.type;
+			item.textContent = PathPresentation.differenceLabel(diff);
+			entry.changes.appendChild(item);
+		}
+		if (scrollSelected && selected) entry.button.scrollIntoView({ block: "nearest" });
+	}
+	updateSelectedPathDiagram(reference || null);
+}
+
+function selectPath(id, fromGraph = false) {
+	if (!state.result || !state.pathExplorer?.select(id)) return;
+	clearHover();
+	updatePathSelectionControls(fromGraph);
+	scheduleRender();
+}
+
+function onClickNode(n) {
+	if (!state.result || !state.pathExplorer?.open(n.id)) return;
+	clearHover();
+	updatePathControls();
+	scheduleRender();
 }
 
 /* --------------------------------------------------------------- geometry */
@@ -344,6 +540,11 @@ function scheduleRender() {
 	state.dirty = true;
 }
 
+function completedEdgeStyle(edge) {
+	return { stroke: "var(--accent)",
+		"stroke-width": 2.2 + Math.min(2.4, Math.log2(edge.count + 1)), opacity: 0.85 };
+}
+
 setInterval(() => {
 	if (state.dirty) {
 		state.dirty = false;
@@ -355,6 +556,7 @@ function render() {
 	const svg = $("#grid");
 	svg.innerHTML = "";
 	if (!state.meta) {
+		svg.classList.remove("exploring-paths");
 		$("#empty-state").style.display = "flex";
 		return;
 	}
@@ -372,6 +574,10 @@ function render() {
 	const colX = (i) => GUT + i * COLW;
 	const rowY = (i) => HDR + i * ROWH;
 	const width = GUT + cols.length * COLW;
+	const pathView = state.pathExplorer?.view();
+	const exploring = Boolean(pathView?.paths.length);
+	const stableChipSlots = Boolean(state.pathExplorer?.index.available);
+	svg.classList.toggle("exploring-paths", exploring);
 
 	/* header: position index + token, then a rule */
 	const gh = el("g", {}, vp);
@@ -396,10 +602,12 @@ function render() {
 		});
 	});
 
-	/* chip layout: group visible nodes per cell, spread them side by side */
-	const visible = [...state.nodes.values()].filter(nodeVisible);
+	/* chip layout: group nodes per cell, spread them side by side */
+	// Exploration-capable results reserve filtered chip slots so revealing path
+	// context never moves existing chips. Other methods keep their old layout.
 	const cells = new Map(); // "rowKey|colIdx" -> [node,...]
-	for (const n of visible) {
+	for (const n of state.nodes.values()) {
+		if (!stableChipSlots && !nodeVisible(n)) continue;
 		const ri = rowIdx.get(rowKeyFor(n));
 		const ci = colIdx.get(colKeyFor(n));
 		if (ri === undefined || ci === undefined) continue;
@@ -410,6 +618,9 @@ function render() {
 
 	const anchors = new Map(); // id -> {cx, top, bottom}
 	const gE = el("g", {}, vp); // edges under chips
+	const gP = exploring ? el("g", { class: "path-overlay" }, vp) : null;
+	const gAlternatives = gP ? el("g", { class: "path-alternatives" }, gP) : null;
+	const gSelected = gP ? el("g", { class: "path-selection" }, gP) : null;
 	const gN = el("g", {}, vp);
 
 	for (const [key, nodesInCell] of cells) {
@@ -417,6 +628,7 @@ function render() {
 		nodesInCell.sort((a, b) => (a.head ?? -1) - (b.head ?? -1));
 		const cw = (COLW - 8) / nodesInCell.length;
 		nodesInCell.forEach((n, i) => {
+			if (!exploring && !nodeVisible(n)) return;
 			const x = colX(ci) + 4 + i * cw;
 			const y = rowY(ri) + 4;
 			const h = ROWH - 10;
@@ -443,6 +655,17 @@ function render() {
 			g.addEventListener("mouseenter", (ev) => onHoverNode(n, ev));
 			g.addEventListener("mousemove", (ev) => onHoverNode(n, ev));
 			g.addEventListener("mouseleave", clearHover);
+			if (state.result && state.pathExplorer?.index.available) {
+				g.setAttribute("role", "button");
+				g.setAttribute("tabindex", "0");
+				g.setAttribute("aria-label", `Explore discovered paths through ${n.id}`);
+				g.addEventListener("click", () => onClickNode(n));
+				g.addEventListener("keydown", (ev) => {
+					if (ev.key !== "Enter" && ev.key !== " ") return;
+					ev.preventDefault();
+					onClickNode(n);
+				});
+			}
 		});
 	}
 
@@ -457,9 +680,7 @@ function render() {
 		const d = `M ${s.cx} ${s.top} C ${s.cx} ${midY}, ${t.cx} ${midY}, ${t.cx} ${t.bottom}`;
 		const attrs = { class: "edge", d, "data-key": `${e.source}->${e.target}` };
 		if (e.complete) {
-			attrs.stroke = "var(--accent)";
-			attrs["stroke-width"] = 2.2 + Math.min(2.4, Math.log2(e.count + 1));
-			attrs.opacity = 0.85;
+			Object.assign(attrs, completedEdgeStyle(e));
 		} else if (state.displayingLiveRun) {
 			attrs.stroke = "var(--accent)";
 			attrs["stroke-width"] = 1.4;
@@ -472,6 +693,31 @@ function render() {
 		}
 		if (state.displayingLiveRun) attrs.class += " searching";
 		const p = el("path", attrs, gE);
+		for (const path of pathView?.edges.get(`${e.source}->${e.target}`) || []) {
+			const layer = path.selected ? gSelected : gAlternatives;
+			const lane = path.offset === 0 ? d : PathExploration.parallelPath(s, t, path.offset);
+			// Fit strokes and hit regions between neighboring fixed lanes, even
+			// when a dense bundle's active lane is no longer the central one.
+			const style = path.selected
+				? { ...completedEdgeStyle(e), "stroke-width": Math.min(completedEdgeStyle(e)["stroke-width"], pathView.laneGap * 1.4) }
+				: { stroke: "var(--path-alternative)", "stroke-width": Math.min(1.4, pathView.laneGap * 0.5), opacity: 0.8 };
+			el("path", { class: `path-stroke ${path.selected ? "path-selected" : "path-alternative"}`,
+				"data-path-id": path.id, "data-key": `${e.source}->${e.target}`, d: lane,
+				...style }, layer);
+			// Hit regions follow each path's own lane rather than choosing an
+			// arbitrary member of a merged edge. Keep neighboring regions narrow.
+			const hit = el("path", { class: "path-hit", d: lane, "data-path-id": path.id,
+				"data-key": `${e.source}->${e.target}`,
+				"stroke-width": Math.min(5, pathView.laneGap * 0.85),
+				"aria-label": `Select Path ${path.ordinal}` }, layer);
+			hit.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				selectPath(path.id, true);
+			});
+			hit.addEventListener("mouseenter", (ev) => onHoverEdge(e, ev));
+			hit.addEventListener("mousemove", moveTooltip);
+			hit.addEventListener("mouseleave", clearHover);
+		}
 		if (state.displayingLiveRun) {
 			// Keep the dash phase continuous across re-renders.
 			p.style.animationDelay = `-${((performance.now() / 1000) % 0.9).toFixed(3)}s`;
@@ -516,6 +762,18 @@ function applyHighlight() {
 	const svg = $("#grid");
 	const chips = svg.querySelectorAll(".chip");
 	const edges = svg.querySelectorAll(".edge");
+	const pathView = state.pathExplorer?.view();
+	if (pathView?.paths.length) {
+		// Persistent provenance selection takes precedence over temporary hover.
+		// Tooltips still work; hovering never replaces the explored/selected path.
+		chips.forEach((c) => {
+			c.classList.toggle("dim", !pathView.focusNodes.has(c.dataset.id));
+			c.classList.toggle("hovered", Boolean(state.hover?.nodes.has(c.dataset.id)));
+		});
+		edges.forEach((e) => { e.classList.add("dim"); e.classList.remove("hot"); });
+		return;
+	}
+	chips.forEach((c) => c.classList.remove("hovered"));
 	if (!state.hover) {
 		chips.forEach((c) => c.classList.remove("dim"));
 		edges.forEach((e) => { e.classList.remove("dim"); e.classList.remove("hot"); });
@@ -617,7 +875,7 @@ function setupPanZoom() {
 	const svg = $("#grid");
 	let panning = null;
 	svg.addEventListener("pointerdown", (e) => {
-		if (e.target.closest(".chip") || e.target.closest(".edge")) return;
+		if (e.target.closest(".chip") || e.target.closest(".edge") || e.target.closest(".path-hit")) return;
 		panning = { x: e.clientX, y: e.clientY, vx: state.view.x, vy: state.view.y };
 		svg.classList.add("panning");
 		svg.setPointerCapture(e.pointerId);
@@ -645,6 +903,122 @@ function setupPanZoom() {
 	$("#zoom-in").addEventListener("click", () => { state.view.k = Math.min(3, state.view.k * 1.2); scheduleRender(); });
 	$("#zoom-out").addEventListener("click", () => { state.view.k = Math.max(0.25, state.view.k / 1.2); scheduleRender(); });
 	$("#zoom-reset").addEventListener("click", () => { state.view = { x: 16, y: 8, k: 1 }; scheduleRender(); });
+}
+
+/* Inspector-only presentation controls; never change paths or the SVG view. */
+function setupPathInspector() {
+	const app = $("#app"), panel = $("#path-explorer"), handle = $("#path-resize-handle");
+	const info = $("#path-info"), infoWrap = $("#path-info-wrap");
+	const sortToggle = $("#path-sort-toggle"), sortWrap = $("#path-sort-wrap");
+	const sortOptions = [...$("#path-sort").querySelectorAll("button")];
+	sortToggle.addEventListener("click", () => setPathSortOpen($("#path-sort-popover").hidden, true));
+	sortToggle.addEventListener("keydown", (event) => {
+		if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+		event.preventDefault();
+		setPathSortOpen(true);
+		focusPathSortOption(event.key === "ArrowUp" ? sortOptions.at(-1) : sortOptions[0]);
+	});
+	for (const [index, option] of sortOptions.entries()) {
+		option.addEventListener("click", () => {
+			if (!state.pathExplorer?.setSortOrder(option.value)) return;
+			updatePathControls();
+			setPathSortOpen(false);
+			sortToggle.focus({ preventScroll: true });
+		});
+		option.addEventListener("keydown", (event) => {
+			const next = { ArrowDown: (index + 1) % sortOptions.length, ArrowUp: (index + sortOptions.length - 1) % sortOptions.length,
+				Home: 0, End: sortOptions.length - 1 }[event.key];
+			if (next === undefined) return;
+			event.preventDefault();
+			focusPathSortOption(sortOptions[next]);
+		});
+	}
+	sortWrap.addEventListener("focusout", (event) => {
+		if (!sortWrap.contains(event.relatedTarget)) setPathSortOpen(false);
+	});
+	const previewInfo = () => {
+		setPathSortOpen(false);
+		if (info.dataset.pinned !== "true") setPathInfoOpen(true);
+	};
+	const dismissPreview = () => {
+		if (info.dataset.pinned !== "true") setPathInfoOpen(false);
+	};
+	infoWrap.addEventListener("pointerenter", previewInfo);
+	infoWrap.addEventListener("pointerleave", dismissPreview);
+	info.addEventListener("focus", previewInfo);
+	info.addEventListener("blur", dismissPreview);
+	info.addEventListener("click", () => {
+		const open = info.dataset.pinned !== "true";
+		setPathInfoOpen(open, open);
+	});
+	document.addEventListener("pointerdown", (event) => {
+		if (!infoWrap.contains(event.target)) setPathInfoOpen(false);
+		if (!sortWrap.contains(event.target)) setPathSortOpen(false);
+	});
+	document.addEventListener("keydown", (event) => {
+		if (event.key === "Escape") {
+			setPathInfoOpen(false);
+			if (!$("#path-sort-popover").hidden) {
+				setPathSortOpen(false);
+				sortToggle.focus({ preventScroll: true });
+			}
+		}
+	});
+
+	const desktop = window.matchMedia("(min-width: 1101px)");
+	// Read the actual grid-track default once, before drag/resize sets an override.
+	const defaultWidth = Number.parseFloat(getComputedStyle(app).getPropertyValue("--path-inspector-width")) || 480;
+	let preferredWidth = defaultWidth, drag = null;
+	const bounds = () => ({ min: 340,
+		max: Math.max(340, Math.min(720, app.getBoundingClientRect().width - $("#sidebar").getBoundingClientRect().width - 320)) });
+	const applyWidth = () => {
+		const { min, max } = bounds();
+		const width = Math.round(Math.max(min, Math.min(max, preferredWidth)));
+		app.style.setProperty("--path-inspector-width", `${width}px`);
+		handle.setAttribute("aria-valuemin", min);
+		handle.setAttribute("aria-valuemax", max);
+		handle.setAttribute("aria-valuenow", width);
+		handle.setAttribute("aria-valuetext", `${width} pixels`);
+		handle.setAttribute("aria-disabled", String(!desktop.matches));
+		handle.tabIndex = desktop.matches ? 0 : -1;
+	};
+	const finishResize = () => {
+		const pointerId = drag?.pointerId;
+		drag = null;
+		app.classList.remove("resizing-path-inspector");
+		if (pointerId !== undefined && handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+	};
+	handle.addEventListener("pointerdown", (event) => {
+		if (!desktop.matches || panel.hidden || event.button !== 0 || event.isPrimary === false) return;
+		event.preventDefault();
+		event.stopPropagation();
+		drag = { pointerId: event.pointerId, x: event.clientX, width: panel.getBoundingClientRect().width };
+		handle.setPointerCapture(event.pointerId);
+		app.classList.add("resizing-path-inspector");
+	});
+	handle.addEventListener("pointermove", (event) => {
+		if (!drag || event.pointerId !== drag.pointerId) return;
+		const { min, max } = bounds();
+		preferredWidth = Math.max(min, Math.min(max, drag.width + drag.x - event.clientX));
+		applyWidth();
+	});
+	for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) handle.addEventListener(type, finishResize);
+	handle.addEventListener("keydown", (event) => {
+		if (!desktop.matches || panel.hidden) return;
+		const { min, max } = bounds();
+		const width = Number(handle.getAttribute("aria-valuenow"));
+		const step = event.shiftKey ? 50 : 20;
+		const widths = { ArrowLeft: Math.min(max, width + step), ArrowRight: Math.max(min, width - step), Home: min, End: max };
+		if (!(event.key in widths)) return;
+		event.preventDefault();
+		preferredWidth = widths[event.key];
+		applyWidth();
+	});
+	handle.addEventListener("dblclick", () => { preferredWidth = defaultWidth; applyWidth(); });
+	const onResize = () => { finishResize(); applyWidth(); };
+	window.addEventListener("resize", onResize);
+	desktop.addEventListener("change", onResize);
+	applyWidth();
 }
 
 /* -------------------------------------------------------------------- API */
@@ -852,6 +1226,8 @@ function attachLiveGraph(job, restoreControls = false) {
 	state.admitQueue = live.admitQueue;
 	state.fresh = live.fresh;
 	state.result = null;
+	state.pathExplorer = null;
+	updatePathControls();
 	state.hover = null;
 	state.displayingLiveRun = Boolean(live.meta);
 	$("#summary").innerHTML = "";
@@ -983,8 +1359,10 @@ function restoreSavedResult(method) {
 	state.meta = { ...saved.meta };
 	loadGraph(saved.graph);
 	state.result = { graph: saved.graph, meta: saved.meta };
+	state.pathExplorer = new PathExploration.Explorer(PathExploration.buildIndex(saved.graph, method));
 	restoreParams(saved.params, method);
 	showSummary(saved.meta);
+	updatePathControls();
 	scheduleRender();
 }
 
@@ -1188,6 +1566,13 @@ function setupSeg(id, onChange) {
 function init() {
 	loadConfig().catch((e) => setStatus(`Config failed: ${e.message}`));
 	setupPanZoom();
+	setupPathInspector();
+	$("#path-clear").addEventListener("click", () => {
+		state.pathExplorer?.clear();
+		clearHover();
+		updatePathControls();
+		scheduleRender();
+	});
 
 	setupSeg("#method-seg", selectMethod);
 	setupSeg("#strategy-seg", (v) => {

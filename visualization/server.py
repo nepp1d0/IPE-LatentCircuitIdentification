@@ -438,8 +438,8 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 				kwargs = ({"min_contribution": req.min_contribution} if req.strategy == "threshold"
 						  else {"max_width": req.max_width})
 				out_root = search(model, metric, root, include_negative=req.include_negative,
-								  on_event=on_event, **kwargs)
-				graph = graph_from_tree(out_root)
+								  joint_scoring=False, on_event=on_event, **kwargs)
+				graph = graph_from_tree(out_root, joint_scoring=False)
 				joint = float(evaluate_tree(out_root, metric))
 			else:
 				search = (PathMessagePatching if req.strategy == "threshold"

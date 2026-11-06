@@ -15,6 +15,7 @@ and the merged variants listed in the node's metadata.
 """
 
 from collections import Counter
+import math
 
 from ipe.nodes import Node, EMBED_Node, MLP_Node, ATTN_Node, FINAL_Node
 
@@ -140,38 +141,120 @@ class _GraphAccumulator:
 		}
 
 
-def graph_from_tree(root: Node) -> dict:
+class _PathProvenance:
+	"""Snapshot original occurrences, never routes through the collapsed DAG.
+
+	Sequences are in data-flow order (embedding -> root). Occurrence IDs refer
+	to original Node objects, whereas node_ids refer to merged grid identities.
+	Distinct occurrences may have identical grid IDs but different Q/K/V reads.
+	"""
+
+	def __init__(self, source: str, order: str):
+		self.source = source
+		self.order = order
+		self.occurrences: dict[int, dict] = {}
+		self.paths: list[dict] = []
+
+	def add(self, path: list[Node], score=None, *, score_kind: str = "unknown") -> None:
+		complete = bool(path and isinstance(path[0], EMBED_Node))
+		value = float(score) if complete and score is not None else None
+		if value is not None and not math.isfinite(value):
+			value = None
+		occurrence_ids = []
+		for n in path:
+			if id(n) not in self.occurrences:
+				d = node_to_dict(n)
+				d["node_id"] = d.pop("id")
+				d["id"] = f"occurrence-{len(self.occurrences) + 1}"
+				d["patch_type"] = getattr(n, "patch_type", None)
+				if isinstance(n, ATTN_Node):
+					for flag in ("patch_query", "patch_key", "patch_value"):
+						d[flag] = getattr(n, flag)
+				self.occurrences[id(n)] = d
+			occurrence_ids.append(self.occurrences[id(n)]["id"])
+		self.paths.append({
+			"id": f"{self.source}-{len(self.paths) + 1}",
+			"occurrence_ids": occurrence_ids,
+			"node_ids": [grid_id(n) for n in path],
+			"complete": complete,
+			"score": value,
+			"score_kind": score_kind if complete else None,
+		})
+
+	def to_dict(self) -> dict:
+		return {
+			"version": 1,
+			"source": self.source,
+			"order": self.order,
+			"occurrences": list(self.occurrences.values()),
+			"paths": self.paths,
+		}
+
+
+def _tree_child_order(n: Node) -> tuple:
+	"""Prefer admission order; legacy trees use component order, not scores."""
+	kv = getattr(n, "keyvalue_position", None)
+	return (getattr(n, "discovery_index", float("inf")), grid_id(n),
+			attn_variant(n) if isinstance(n, ATTN_Node) else "",
+			-1 if kv is None else kv)
+
+
+def graph_from_tree(root: Node, *, joint_scoring: bool | None = None) -> dict:
 	"""Collapse the tree grown by TreeMessagePatching* into the grid DAG.
 
 	Nodes on branches that were pruned before reaching the embeddings are marked
 	`complete: false` (unless they also lie on a complete branch) so the frontend
-	can render them differently."""
+	can render them differently. Complete branches retain their original terminal
+	embedding's admission score. The caller must identify the search's scoring
+	mode: None keeps legacy/unknown scores distinct from isolated path effects.
+	No contributions are evaluated here."""
 	acc = _GraphAccumulator()
 	memo: dict = {}
+	branches = []
 
-	def walk(n: Node) -> None:
+	def walk(n: Node, ancestors: list[Node]) -> None:
+		branch = ancestors + [n]
+		if not n.children:
+			branches.append(list(reversed(branch)))
 		acc.add_node(n, complete=_subtree_reaches_embed(n, memo))
 		for child in n.children:
 			acc.add_edge(child, n, complete=_subtree_reaches_embed(child, memo))
-			walk(child)
+			walk(child, branch)
 
-	walk(root)
-	return acc.to_dict()
+	walk(root, [])
+	has_order = all(hasattr(branch[0], "discovery_index") for branch in branches)
+
+	if has_order:
+		branches.sort(key=lambda branch: branch[0].discovery_index)
+	else:
+		branches.sort(key=lambda branch: tuple(_tree_child_order(n) for n in reversed(branch)))
+	provenance = _PathProvenance("tree", "discovery" if has_order else "tree")
+	score_kind = ("isolated_path_effect" if joint_scoring is False else
+				  "joint_candidate_effect" if joint_scoring is True else "unknown")
+	for branch in branches:
+		score = getattr(branch[0], "contribution", None) if isinstance(branch[0], EMBED_Node) else None
+		provenance.add(branch, score, score_kind=score_kind)
+	return {**acc.to_dict(), "path_provenance": provenance.to_dict()}
 
 
 def graph_from_paths(paths: list[tuple[float, list[Node]]]) -> dict:
 	"""Collapse PathMessagePatching* results (score, [leaf, ..., root]) into the
-	grid DAG. Completed paths always reach the embeddings, so every node is
-	complete; a node's contribution is the strongest path score through it."""
+	grid DAG. Original whole-path scores stay separate from the merged nodes'
+	branch-admission scores (or path-score fallbacks for legacy nodes)."""
 	acc = _GraphAccumulator()
+	has_order = all(path and hasattr(path[0], "discovery_index") for _, path in paths)
+	ordered = sorted(paths, key=lambda item: item[1][0].discovery_index) if has_order else paths
+	provenance = _PathProvenance("path", "discovery" if has_order else "result")
+	for score, path in ordered:
+		provenance.add(path, score, score_kind="isolated_path_effect")
 	for score, path in paths:
 		for n in path:
 			# The leaf-side score is the whole path's contribution; per-node
 			# admission scores were stored on the nodes by the search when
 			# available and take precedence in add_node.
-			if getattr(n, "contribution", None) is None:
+			if getattr(n, "contribution", None) is None and score is not None:
 				n.contribution = float(score)
 			acc.add_node(n, complete=True)
 		for child, parent in zip(path[:-1], path[1:]):
 			acc.add_edge(child, parent)
-	return acc.to_dict()
+	return {**acc.to_dict(), "path_provenance": provenance.to_dict()}

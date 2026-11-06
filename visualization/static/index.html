@@ -141,7 +141,76 @@
 		<svg id="grid" role="img" aria-label="Model computational grid: layers on the y axis, token positions on the x axis"></svg>
 		<div id="tooltip" hidden></div>
 	</main>
+
+	<aside id="path-explorer" hidden aria-labelledby="path-heading">
+		<div id="path-resize-handle" role="separator" tabindex="0" aria-label="Resize Path Inspector"
+			aria-orientation="vertical" aria-controls="path-explorer" aria-valuemin="340" aria-valuemax="720" aria-valuenow="480"
+			title="Drag to resize. Left arrow widens; right arrow narrows. Double-click to reset."></div>
+		<header class="path-inspector-header">
+			<div class="path-heading-row">
+				<h2 id="path-heading">Paths through node</h2>
+				<div class="path-header-actions">
+					<button id="path-clear" type="button">Clear</button>
+					<div id="path-info-wrap">
+						<button id="path-info" type="button" aria-label="About path exploration" aria-expanded="false" aria-controls="path-info-popover" aria-describedby="path-info-popover">i</button>
+						<div id="path-info-popover" role="note" hidden>
+							<strong>Exploring paths</strong>
+							<ul>
+								<li>Click a circuit component to explore the complete discovered paths passing through it.</li>
+								<li>Select a path from the graph or the list to highlight it and inspect its components.</li>
+								<li>Compare paths by their structural and Q/KV patching differences.</li>
+								<li>Path contribution scores measure the effect of a path intervention on the selected output metric, not probabilities or importance percentages.</li>
+							</ul>
+							<p class="path-info-note">Only complete discovered paths are selectable. The contribution filter is temporarily paused during exploration.</p>
+						</div>
+					</div>
+				</div>
+			</div>
+			<div id="path-node"></div>
+			<div id="path-count" role="status" aria-live="polite"></div>
+			<div id="path-legend-row">
+				<div id="path-key" class="path-exploration-legend" aria-label="Path highlighting">
+					<span><span class="path-line-sample selected" aria-hidden="true"></span>Selected</span>
+					<span><span class="path-line-sample alternative" aria-hidden="true"></span>Alternatives</span>
+				</div>
+				<div id="path-sort-wrap">
+					<button id="path-sort-toggle" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="path-sort">
+						<span aria-hidden="true">⇅</span> Sort <span id="path-sort-current">Discovery</span>
+						<span aria-hidden="true">▾</span>
+					</button>
+					<div id="path-sort-popover" hidden>
+						<div id="path-sort" role="menu" aria-labelledby="path-sort-toggle">
+							<button class="path-sort-option" type="button" role="menuitemradio" aria-checked="true" tabindex="-1" value="discovery">
+								<span class="path-sort-check" aria-hidden="true">✓</span>
+								<span><strong>Discovery order</strong><small>Original discovery order.</small></span>
+							</button>
+							<button class="path-sort-option" type="button" role="menuitemradio" aria-checked="false" tabindex="-1" value="signed">
+								<span class="path-sort-check" aria-hidden="true">✓</span>
+								<span><strong>Signed contribution</strong><small>Highest signed path contribution first.</small></span>
+							</button>
+							<button class="path-sort-option" type="button" role="menuitemradio" aria-checked="false" tabindex="-1" value="absolute">
+								<span class="path-sort-check" aria-hidden="true">✓</span>
+								<span><strong>Absolute contribution</strong><small>Largest absolute path contribution first.</small></span>
+							</button>
+						</div>
+						<p>List only; graph lanes and selection stay fixed.</p>
+					</div>
+				</div>
+			</div>
+			<p id="path-help" class="hint" hidden></p>
+		</header>
+		<p id="path-score-context" hidden></p>
+		<div id="path-list" role="group" aria-label="Original discovered paths" aria-describedby="path-score-context"></div>
+		<section id="selected-path-details" hidden aria-labelledby="selected-path-heading">
+			<h3 id="selected-path-heading">Selected path components</h3>
+			<div id="selected-path-meta"></div>
+			<div id="selected-path-diagram" tabindex="0" aria-label="Selected path diagram, independently scrollable"></div>
+		</section>
+	</aside>
 </div>
+<script src="/static/path_exploration.js"></script>
+<script src="/static/path_presentation.js"></script>
+<script src="/static/path_diagram.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
