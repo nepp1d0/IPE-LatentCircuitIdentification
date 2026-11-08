@@ -2,8 +2,9 @@
 
 /* IPE circuit discovery frontend.
  *
- * The main view is an SVG grid: token positions on the x axis, layers on the
- * y axis (FINAL at the top, per layer MLP above ATTN, EMB at the bottom).
+ * The main view is an SVG grid: token positions (or heads for non-positional
+ * searches) on the x axis, layers on the y axis (FINAL at the top, per layer
+ * MLP above ATTN, EMB at the bottom).
  * The whole model is drawn as faint placeholder cells; discovered components
  * are rendered as head-level chips on top of it and the circuit's edges as
  * bezier links between chips (a horizontal jog = a K/V read at an earlier
@@ -13,7 +14,7 @@
 const $ = (s) => document.querySelector(s);
 
 const GUT = 64;      // left gutter for row labels
-const COLW = 76;     // column width (one token position)
+const COLW = 76;     // column width (one token position or attention head)
 const ROWH = 32;     // row height (one layer band)
 const HDR = 44;      // header height (position index + token)
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -495,13 +496,12 @@ function rowKeyFor(n) {
 	return `${n.kind}${n.layer}`;
 }
 
-/* Two x-axis layouts. The IPE searches are positional, so the columns are token
- * positions. ACDC is position-agnostic but head-resolved, so laying its result
- * out by token would pile all 144 heads into one column: there the columns are
- * head indices instead, plus a trailing column for the head-less components
- * (MLP / EMB / FINAL). */
+/* Positional IPE searches use token columns. All position-agnostic searches
+ * share ACDC's head columns, plus a trailing column for MLP / EMB / FINAL.
+ * Derive this from positional metadata as well as the explicit layout so
+ * previews, live runs and saved results (including older metadata) agree. */
 function byHead() {
-	return state.meta.layout === "head";
+	return state.meta.layout === "head" || state.meta.positional === false;
 }
 
 function colList() {
@@ -808,7 +808,7 @@ function onHoverNode(n, ev) {
 	if (n.kv_positions && n.kv_positions.length) {
 		rowsOut.push(`K/V read at: ${n.kv_positions.map((p) => `${escapeHtml(p)} ${escapeHtml(visibleToken(tokens[p] ?? ""))}`).join(", ")}`);
 	}
-	if (n.merged > 1 && !byHead()) rowsOut.push(`<span class="tt-dim">${escapeHtml(n.merged)} tree nodes merged</span>`);
+	if (n.merged > 1 && state.method !== "acdc") rowsOut.push(`<span class="tt-dim">${escapeHtml(n.merged)} tree nodes merged</span>`);
 	if (n.complete === false) rowsOut.push(`<span class="tt-dim">on a pruned branch (never reached EMB)</span>`);
 	if (n.kind === "mlp" || n.kind === "attn") {
 		const lens = n.component_logit_lens;
@@ -826,17 +826,18 @@ function onHoverNode(n, ev) {
 }
 
 function onHoverEdge(e, ev) {
+	const acdc = state.method === "acdc";
 	state.hover = { nodes: new Set([e.source, e.target]), edges: new Set([`${e.source}->${e.target}`]) };
 	applyHighlight();
 	const s = state.nodes.get(e.source), t = state.nodes.get(e.target);
 	const rows = [`<div class="tt-title">${escapeHtml(s ? nodeLabel(s) : e.source)} &rarr; ${escapeHtml(t ? nodeLabel(t) : e.target)}</div>`];
 	if (e.contribution !== null && e.contribution !== undefined) {
-		rows.push(byHead()
+		rows.push(acdc
 			? `strongest effect of cutting it: <b>${fmt(e.contribution)}</b>`
 			: `strongest branch: <b>${fmt(e.contribution)}</b>`);
 	}
 	if (e.count > 1) {
-		rows.push(`<span class="tt-dim">${e.count} ${byHead() ? "hook-level" : "tree"} edges merged</span>`);
+		rows.push(`<span class="tt-dim">${e.count} ${acdc ? "hook-level" : "tree"} edges merged</span>`);
 	}
 	rows.push(e.complete
 		? `<span class="tt-dim">on a complete branch (reaches EMB)</span>`
