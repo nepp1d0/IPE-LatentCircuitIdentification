@@ -7,6 +7,7 @@ const vm = require("node:vm");
 const P = require("../../visualization/static/path_exploration.js");
 const PathDiagram = require("../../visualization/static/path_diagram.js");
 const PathPresentation = require("../../visualization/static/path_presentation.js");
+const ComponentDecoding = require("../../visualization/static/component_decoding.js");
 const { fixture, occurrenceFixture } = require("./path_fixtures.cjs");
 
 /* Minimal SVG/DOM harness: exercise the actual app's rendering/event handlers
@@ -78,6 +79,7 @@ function appHarness(inspectorWidth = "480px") {
 	const make = (tag) => { const node = new Element(tag); node.ownerDocument = document; return node; };
 	const window = new Element("window"), mediaQueries = new Map();
 	window.innerWidth = 1440;
+	window.innerHeight = 1000;
 	window.matchMedia = (query) => {
 		if (!mediaQueries.has(query)) {
 			const media = new Element("media");
@@ -92,6 +94,9 @@ function appHarness(inspectorWidth = "480px") {
 		width: Number.parseFloat(get("#app").style["--path-inspector-width"] || "480"), height: 948 });
 	get("#path-info-wrap").appendChild(get("#path-info"));
 	get("#path-info-wrap").appendChild(get("#path-info-popover"));
+	get("#component-decoding-info-wrap").appendChild(get("#component-decoding-info"));
+	get("#component-decoding-info-wrap").appendChild(get("#component-decoding-info-popover"));
+	get("#component-decoding-info-popover").hidden = true;
 	get("#path-sort-wrap").appendChild(get("#path-sort-toggle"));
 	get("#path-sort-wrap").appendChild(get("#path-sort-popover"));
 	get("#path-sort-popover").appendChild(get("#path-sort"));
@@ -110,7 +115,7 @@ function appHarness(inspectorWidth = "480px") {
 		}
 		window.emit("resize");
 	};
-	const context = vm.createContext({ PathExploration: P, PathDiagram, PathPresentation, console,
+	const context = vm.createContext({ PathExploration: P, PathDiagram, PathPresentation, ComponentDecoding, console,
 		EventSource: class { close() {} },
 		document,
 		window,
@@ -644,17 +649,17 @@ test("selected diagram adapts the original marker styles and query links, preser
 	assert.equal(app.get("#selected-path-details").hidden, false);
 	assert.deepEqual(groups().map((g) => g.dataset.kind), ["final", "mlp", "attn", "embed"]);
 	assert.deepEqual(groups().map((g) => g.dataset.occurrenceId), ["path-1-occ-3", "path-1-occ-2", "path-1-occ-1", "path-1-occ-0"]);
-	assert.equal(groups()[0].querySelectorAll("rect")[0].attrs.fill, "#FFA07A");
-	assert.equal(groups()[1].querySelectorAll("rect")[0].attrs.fill, "#90EE90");
+	assert.equal(groups()[0].querySelectorAll("rect")[1].attrs.fill, "#FFA07A");
+	assert.equal(groups()[1].querySelectorAll("rect")[1].attrs.fill, "#90EE90");
 	assert.equal(groups()[2].querySelectorAll("circle")[0].attrs.fill, "#B0C4DE");
-	assert.equal(groups()[3].querySelectorAll("rect")[0].attrs.fill, "#FFDAB9");
+	assert.equal(groups()[3].querySelectorAll("rect")[1].attrs.fill, "#FFDAB9");
 	assert.match(groups()[2].textContent, /A0H0 · Layer 0.*Query\/output position: 1.*Patch Q/);
 	assert.doesNotMatch(groups()[2].textContent, /unspecified|Source position/);
 	assert.ok(groups()[2].querySelectorAll(".path-component-token").some((n) => n.textContent.includes('"word"')));
 	assert.match(diagram.querySelectorAll(".path-token-context")[0].textContent, /first clean prompt/);
 	assert.equal(diagram.querySelectorAll(".path-component-link").length, 3);
 	assert.equal(diagram.querySelectorAll(".path-component-link").filter((n) => n.attrs["stroke-dasharray"]).length, 1);
-	assert.ok(groups().every((g) => Object.keys(g.events).length === 0)); // no message-decoding interactions
+	assert.ok(groups().every((g) => g.attrs.role === "button" && g.attrs.tabindex === "0"));
 	app.get("#path-list").scrollTop = 500;
 	diagram.scrollTop = 120;
 	pathButtons(app)[2].emit("click");
@@ -729,6 +734,271 @@ test("contradictory original flags cannot create a Q label or dotted query conne
 	assert.equal(diagram.querySelectorAll(".path-component-link").some((n) => n.attrs["stroke-dasharray"]), false);
 });
 
+});
+
+describe("Component decoding within the selected path", () => {
+
+	function decodedFixture(method = "path", positional = true) {
+		const graph = occurrenceFixture();
+		graph.path_provenance.source = method;
+		for (const n of [...graph.nodes, ...graph.path_provenance.occurrences]) {
+			if (!positional) n.position = null;
+		}
+		for (const n of graph.nodes.filter((n) => ["attn", "mlp"].includes(n.kind))) {
+			n.component_logit_lens = { available: true, convention: "isolated_component_softmax",
+				position: n.position ?? 1, position_token: n.position === 0 ? "BOS" : "word",
+				top_tokens: [0.2, 0.1, 0.03, 0.02, 0.01, 0.005, 0.002, 0.001, 1e-10, 0].map((probability, i) => ({ rank: i + 1, token: ` ${n.id}<${i}>`, probability })) };
+		}
+		return graph;
+	}
+	const components = (app) => app.get("#selected-path-diagram").querySelectorAll(".path-component");
+	const chart = (app) => app.get("#component-decoding-content");
+	const selectComponent = (app, kind) => components(app).find((g) => g.dataset.kind === kind).emit("click");
+
+	for (const method of ["tree", "path"]) test(`${method}: clicking/keyboard-decoding leaves path, graph and cached scores unchanged`, () => {
+		const app = appHarness(), graph = decodedFixture(method);
+		const cached = saved(graph, method), original = JSON.stringify(cached);
+		app.state.savedResults[method] = cached;
+		app.restoreSavedResult(method);
+		app.onClickNode({ id: "a" });
+		app.render();
+		const geometry = snapshotGraph(app.get), lanes = laneSnapshot(app.get("#grid"));
+		const view = JSON.stringify(app.state.view), reference = app.state.pathExplorer.selectedId;
+		assert.match(chart(app).textContent, /Select a component/);
+		app.get("#selected-path-diagram").scrollTop = 80;
+		app.get("#path-list").scrollTop = 100;
+		const attention = components(app).find((g) => g.dataset.kind === "attn");
+		attention.focus();
+		attention.emit("click");
+		assert.equal(attention.attrs["aria-pressed"], "true");
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 9);
+		assert.match(chart(app).textContent, /A0H0Query\/output position: 1 \("word"\)/);
+		assert.match(chart(app).textContent, /0\.2000/);
+		const bars = chart(app).querySelectorAll(".component-decoding-bar");
+		assert.equal(Number(bars[1].attrs.width) / Number(bars[0].attrs.width), 0.5);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-probability")[0].dataset.probability, "0.2");
+		assert.equal(chart(app).querySelectorAll(".component-decoding-axis-title")[0].textContent, "Probability");
+		assert.equal(chart(app).querySelectorAll(".component-decoding-gridline").length,
+			chart(app).querySelectorAll(".component-decoding-tick").length);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-token")[0].textContent, "␠a<0>");
+		assert.equal(chart(app).querySelectorAll("script").length, 0);
+		assert.equal(app.document.activeElement, attention, "component selection must not replace focused diagram elements");
+		const mlp = components(app).find((g) => g.dataset.kind === "mlp");
+		mlp.emit("keydown", { key: "ArrowDown" });
+		assert.equal(attention.attrs["aria-pressed"], "true");
+		mlp.emit("keydown", { key: "Enter" });
+		assert.equal(attention.attrs["aria-pressed"], "false");
+		assert.equal(mlp.attrs["aria-pressed"], "true");
+		assert.match(chart(app).textContent, /MLP0Token position: 1/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-token")[0].textContent, "␠b<0>");
+		attention.emit("keydown", { key: " " });
+		assert.equal(attention.attrs["aria-pressed"], "true");
+		assert.equal(app.get("#selected-path-diagram").scrollTop, 80);
+		assert.equal(app.get("#path-list").scrollTop, 100);
+		assert.equal(app.state.pathExplorer.selectedId, reference);
+		assert.equal(app.state.pathExplorer.nodeId, "a");
+		assert.equal(JSON.stringify(app.state.view), view);
+		assert.deepEqual(snapshotGraph(app.get), geometry);
+		assert.deepEqual(laneSnapshot(app.get("#grid")), lanes);
+		assert.equal(JSON.stringify(cached), original);
+	});
+
+	test("two heads in the same summary select their own cached payload without changing the path", () => {
+		const app = appHarness(), graph = decodedFixture();
+		const second = graph.nodes.find((n) => n.id === "second-head");
+		const path = graph.path_provenance.paths[0];
+		path.node_ids[2] = second.id;
+		Object.assign(graph.path_provenance.occurrences.find((n) => n.id === path.occurrence_ids[2]),
+			{ ...second, id: path.occurrence_ids[2], node_id: second.id });
+		graph.edges.push({ source: "a", target: second.id, count: 1 }, { source: second.id, target: "f", count: 1 });
+		app.state.savedResults.path = saved(graph);
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		const heads = components(app).filter((g) => g.dataset.kind === "attn");
+		heads[0].emit("click");
+		assert.match(chart(app).textContent, /A0H1/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-token")[0].attrs["aria-label"], "␠second-head<0>");
+		heads[1].emit("click");
+		assert.match(chart(app).textContent, /A0H0/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-token")[0].textContent, "␠a<0>");
+		assert.equal(app.state.pathExplorer.selectedId, "path-1");
+	});
+
+	test("position zero is decoded as BOS and contradictory occurrence coordinates never reuse a grid readout", () => {
+		const app = appHarness(), graph = decodedFixture();
+		const mlp = graph.nodes.find((n) => n.id === "b");
+		mlp.position = mlp.component_logit_lens.position = 0;
+		mlp.component_logit_lens.position_token = "BOS";
+		for (const n of graph.path_provenance.occurrences.filter((n) => n.node_id === "b")) n.position = 0;
+		graph.path_provenance.occurrences.find((n) => n.id === "path-1-occ-1").position = 0;
+		app.state.savedResults.path = saved(graph);
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "mlp");
+		assert.match(chart(app).textContent, /Token position: 0 \("BOS"\)/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 9);
+		selectComponent(app, "attn");
+		assert.match(chart(app).textContent, /Matching component metadata is unavailable/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 0);
+	});
+
+	test("decoding information toggles and dismisses without changing component or path selection", () => {
+		const app = appHarness();
+		app.state.savedResults.path = saved(decodedFixture());
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		const info = app.get("#component-decoding-info"), popover = app.get("#component-decoding-info-popover");
+		const reference = app.state.pathExplorer.selectedId, selection = app.state.componentSelection;
+		const before = chart(app).textContent;
+		assert.equal(popover.hidden, true);
+		info.emit("click");
+		assert.equal(info.attrs["aria-expanded"], "true");
+		assert.equal(popover.hidden, false);
+		app.document.emit("pointerdown", { target: popover });
+		assert.equal(popover.hidden, false);
+		app.document.emit("keydown", { key: "Escape" });
+		assert.equal(popover.hidden, true);
+		assert.equal(info.attrs["aria-expanded"], "false");
+		assert.equal(app.document.activeElement, info);
+		info.emit("click");
+		info.emit("click");
+		assert.equal(popover.hidden, true);
+		info.emit("click");
+		app.document.emit("pointerdown", { target: app.get("#grid") });
+		assert.equal(popover.hidden, true);
+		info.emit("click");
+		app.get("#component-decoding-info-wrap").emit("focusout", { relatedTarget: app.get("#path-clear") });
+		assert.equal(popover.hidden, true);
+		assert.equal(app.state.pathExplorer.selectedId, reference);
+		assert.equal(app.state.componentSelection, selection);
+		assert.equal(chart(app).textContent, before);
+		info.emit("click");
+		pathButtons(app)[1].emit("click");
+		assert.equal(popover.hidden, true, "switching paths clears the popover");
+		info.emit("click");
+		app.get("#path-clear").emit("click");
+		assert.equal(popover.hidden, true, "clearing the Inspector clears the popover");
+	});
+
+	test("decoding information fits the scrolling Inspector and repositions while open", () => {
+		const app = appHarness(), info = app.get("#component-decoding-info");
+		const panel = app.get("#path-explorer"), popover = app.get("#component-decoding-info-popover");
+		panel.getBoundingClientRect = () => ({ left: 280, top: 400, width: 620, height: 250 });
+		info.bounds = { left: 850, top: 450, width: 22, height: 22 };
+		info.emit("click");
+		assert.equal(popover.dataset.side, "below");
+		assert.equal(popover.style.maxHeight, "170px");
+		info.bounds.top = 600;
+		panel.emit("scroll");
+		assert.equal(popover.dataset.side, "above");
+		assert.equal(popover.style.maxHeight, "192px");
+		info.bounds.top = 450;
+		app.resizeWindow(900);
+		assert.equal(popover.dataset.side, "below");
+		assert.equal(popover.style.maxHeight, "170px");
+		assert.equal(popover.hidden, false);
+	});
+
+	test("histogram renderer accepts token/probability pairs without component-specific metadata", () => {
+		const app = appHarness();
+		const plot = app.document.createElement("div"), axis = app.document.createElementNS("http://www.w3.org/2000/svg", "svg");
+		const tokens = [{ token: " generic", probability: 0.189 }, { token: "other", probability: 1e-12 }];
+		ComponentDecoding.renderHistogram(plot, axis, tokens);
+		assert.equal(plot.querySelectorAll(".component-decoding-row").length, 2);
+		assert.equal(plot.querySelectorAll(".component-decoding-probability")[0].textContent, "0.1890");
+		assert.equal(plot.querySelectorAll(".component-decoding-probability")[1].textContent, "1.000e-12");
+		assert.equal(axis.querySelectorAll(".component-decoding-axis-title")[0].textContent, "Probability");
+		assert.doesNotMatch(plot.querySelectorAll("svg")[0].attrs["aria-label"], /component|path/i);
+		assert.equal(app.state.componentSelection, null);
+	});
+
+	test("sorting preserves component selection; path/method/result changes and live discovery clear stale data", () => {
+		const app = appHarness(), graph = decodedFixture();
+		app.state.savedResults.path = saved(graph);
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		const selection = app.state.componentSelection;
+		app.get("#path-sort").querySelectorAll("button")[1].emit("click");
+		assert.equal(app.state.componentSelection, selection);
+		assert.match(chart(app).textContent, /A0H0/);
+		const oldButton = components(app).find((g) => g.dataset.kind === "attn");
+		pathButtons(app).find((b) => b.dataset.pathId === "path-2").emit("click");
+		assert.equal(app.state.componentSelection, null);
+		assert.match(chart(app).textContent, /Select a component/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 0);
+		oldButton.emit("click"); // A delayed event from the previous diagram must be ignored.
+		assert.equal(app.state.componentSelection, null);
+		selectComponent(app, "mlp");
+		assert.match(chart(app).textContent, /MLP1/);
+		app.restoreSavedResult("path");
+		assert.equal(app.state.componentSelection, null);
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		const live = { method: "path", params: {}, meta: null, liveState: app.createLiveGraphState() };
+		app.attachLiveGraph(live);
+		assert.equal(app.state.componentSelection, null);
+		assert.equal(app.get("#selected-path-details").hidden, true);
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		app.state.savedResults.acdc = saved(fixture("acdc"), "acdc");
+		app.selectMethod("acdc");
+		app.onClickNode({ id: "a" });
+		assert.equal(app.state.componentSelection, null);
+		assert.equal(app.get("#path-explorer").hidden, true);
+	});
+
+	test("non-positional fallback is explicit and different K/V occurrences reuse the full-head readout", () => {
+		const app = appHarness(), graph = decodedFixture("path", false);
+		Object.assign(graph.path_provenance.occurrences.find((n) => n.id === "path-3-occ-1"), { variant: "KV", kv_position: null });
+		const result = saved(graph);
+		result.meta.positional = false;
+		app.state.savedResults.path = result;
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		const decoding = chart(app).textContent;
+		assert.match(decoding, /Query\/output position: 1/);
+		assert.match(decoding, /last clean-prompt token/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-disclaimer")[0].textContent,
+			"Exploratory component projection, not the full model's next-token probabilities or the selected path's causal contribution.");
+		assert.equal(chart(app).querySelectorAll(".component-decoding-context").length, 0);
+		assert.doesNotMatch(decoding, /Zero-based positions|⇥ tab|↵ newline/);
+		assert.doesNotMatch(decoding, /not restricted to the path's K\/V source/);
+		pathButtons(app)[2].emit("click");
+		selectComponent(app, "attn");
+		assert.equal(chart(app).textContent, decoding);
+		assert.match(components(app).find((g) => g.dataset.kind === "attn").textContent, /Source positions: all eligible/);
+	});
+
+	test("unsupported/missing/invalid readouts and empty circuits replace, rather than retain, the previous chart", () => {
+		const app = appHarness(), graph = decodedFixture();
+		graph.nodes.find((n) => n.id === "b").component_logit_lens = { available: false };
+		app.state.savedResults.path = saved(graph);
+		app.restoreSavedResult("path");
+		app.onClickNode({ id: "a" });
+		selectComponent(app, "attn");
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 9);
+		selectComponent(app, "mlp");
+		assert.match(chart(app).textContent, /No cached component decoding/);
+		assert.equal(chart(app).querySelectorAll(".component-decoding-row").length, 0);
+		for (const kind of ["embed", "final"]) {
+			selectComponent(app, kind);
+			assert.match(chart(app).textContent, /individual attention heads and MLP outputs only/);
+		}
+		graph.nodes.find((n) => n.id === "a").component_logit_lens.top_tokens[0].probability = NaN;
+		selectComponent(app, "attn");
+		assert.match(chart(app).textContent, /Valid token probabilities are unavailable/);
+		app.onClickNode({ id: "spare" });
+		assert.equal(app.state.componentSelection, null);
+		assert.equal(app.get("#selected-path-details").hidden, true);
+		app.state.savedResults.path = saved({ nodes: [], edges: [], path_provenance: { version: 1, source: "path", paths: [] } });
+		app.restoreSavedResult("path");
+		assert.equal(app.get("#selected-path-details").hidden, true);
+		assert.equal(app.get("#selected-path-diagram").children.length, 0);
+	});
 });
 
 describe("Application lifecycle, filtering and navigation state", () => {

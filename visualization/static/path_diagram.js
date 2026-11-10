@@ -96,7 +96,15 @@ const PathDiagram = (() => {
 		return lines;
 	}
 
-	function render(container, path, { name, variant, meta = {}, occurrences = [] }) {
+	function select(container, selectedIndex) {
+		for (const group of container.querySelectorAll(".path-component")) {
+			if (group.getAttribute("role") === "button") {
+				group.setAttribute("aria-pressed", String(Number(group.dataset.componentIndex) === selectedIndex));
+			}
+		}
+	}
+
+	function render(container, path, { name, variant, meta = {}, occurrences = [], onSelect, selectedIndex = null }) {
 		container.replaceChildren();
 		if (!path) return;
 		const document = container.ownerDocument;
@@ -112,7 +120,7 @@ const PathDiagram = (() => {
 		const originals = new Set(occurrences);
 		const components = path.components.map((n, i) => {
 			const original = originals.has(n) && n.node_id === path.sequence[i];
-			return { n, original, rows: metadataRows(n, { variant, meta, original }) };
+			return { n, index: i, original, rows: metadataRows(n, { variant, meta, original }) };
 		}).reverse();
 		const hasTokens = components.some((c) => c.rows.some((r) => r.token));
 		if (hasTokens) {
@@ -122,10 +130,10 @@ const PathDiagram = (() => {
 			container.appendChild(context);
 		}
 		const svg = svgEl("svg", { viewBox: "0 0 268 64", width: "100%", height: 64,
-			role: "img" }, container);
+			role: onSelect ? "group" : "img" }, container);
 		const links = svgEl("g", {}, svg), centers = [], descriptions = [];
 		let cy = 24, bottom = 64;
-		components.forEach(({ n, rows }) => {
+		components.forEach(({ n, rows, index: componentIndex }) => {
 			centers.push(cy);
 			const style = componentStyle(n.kind);
 			const group = svgEl("g", { class: "path-component", "data-kind": n.kind,
@@ -134,6 +142,26 @@ const PathDiagram = (() => {
 			const description = [name(n) + layer, ...rows.map((r) => r.label + (r.token || ""))].join("; ");
 			descriptions.push(description);
 			svgEl("title", {}, group, description);
+			const hit = onSelect ? svgEl("rect", { class: "path-component-hit", x: 2, y: cy - 23,
+				width: 264, height: 40, rx: 5 }, group) : null;
+			if (onSelect) {
+				group.setAttribute("role", "button");
+				group.setAttribute("tabindex", "0");
+				group.setAttribute("data-component-index", componentIndex);
+				group.setAttribute("aria-pressed", String(componentIndex === selectedIndex));
+				group.setAttribute("aria-label", `Show component decoding: ${description}`);
+				group.setAttribute("aria-controls", "component-decoding-content");
+				group.addEventListener("click", (event) => {
+					event.stopPropagation();
+					onSelect(componentIndex);
+				});
+				group.addEventListener("keydown", (event) => {
+					if (event.key !== "Enter" && event.key !== " ") return;
+					event.preventDefault();
+					event.stopPropagation();
+					onSelect(componentIndex);
+				});
+			}
 			const attrs = { fill: style.color, stroke: "#555555", "stroke-width": 2 };
 			if (style.symbol === "circle") svgEl("circle", { ...attrs, cx: 18, cy, r: 9 }, group);
 			else if (style.symbol === "square") svgEl("rect", { ...attrs, x: 9, y: cy - 9, width: 18, height: 18 }, group);
@@ -154,8 +182,9 @@ const PathDiagram = (() => {
 					y += index === 0 ? 16 : 14;
 				}
 			}
+			if (hit) hit.setAttribute("height", Math.max(40, y - cy + 19));
 			bottom = y + 8;
-			cy = Math.max(cy + 64, y + 18);
+			cy = Math.max(cy + 64, y + 22);
 		});
 		for (let i = 1; i < components.length; i++) {
 			const target = components[i - 1];
@@ -170,7 +199,7 @@ const PathDiagram = (() => {
 		svg.setAttribute("aria-label", `Path ${path.ordinal} (${path.id}), FINAL to EMB${hasTokens ? " (token labels from the first clean prompt)" : ""}: ${descriptions.join(" → ")}`);
 	}
 
-	return { componentStyle, metadataRows, wrapSegments, render };
+	return { componentStyle, metadataRows, wrapSegments, select, render };
 })();
 
 if (typeof module !== "undefined") module.exports = PathDiagram;

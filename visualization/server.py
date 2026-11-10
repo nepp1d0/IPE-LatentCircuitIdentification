@@ -422,7 +422,7 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 			metric = experiment.metric
 			root = experiment.root
 			job.push({"event": "status", "status": "running", "message": "Preparing live component readouts..."})
-			lens = LiveComponentLogitLens(model, req.prompts[0], experiment.cache)
+			lens = LiveComponentLogitLens(model, req.prompts[0], experiment.cache, top_k=9)
 			if job.cancel_requested:
 				raise SearchCancelled()
 

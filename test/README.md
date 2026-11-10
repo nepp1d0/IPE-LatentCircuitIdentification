@@ -14,6 +14,7 @@ test/
 ├── test_nodes.py
 ├── test_path_provenance.py
 └── visualization/
+    ├── component_decoding.test.cjs
     ├── path_comparison.test.cjs
     ├── path_diagram.test.cjs
     ├── path_exploration.test.cjs
@@ -27,23 +28,24 @@ test/
 
 | File | Coverage |
 | --- | --- |
+| `component_decoding.test.cjs` | Component readout validation, token positions and fallback, Top-9 probabilities, numerical formatting, axis scaling, and responsive chart geometry. |
 | `path_comparison.test.cjs` | Component alignment, structural differences, Q/K/V interventions, and missing metadata. |
-| `path_diagram.test.cjs` | Diagram metadata, patch variants, clean-token labels, and Unicode/text wrapping. |
-| `path_exploration.test.cjs` | Provenance indexing and validation, path identities, selection, sorting, and stable lane geometry. |
-| `path_inspector.test.cjs` | Application integration: headers, help, resizing, graph/list selection, comparisons, scores, diagrams, filtering, and result/live-run state. |
-| `path_inspector_layout.test.cjs` | Real Chromium layout, responsive sizing, overflow, keyboard/pointer controls, and circuit-navigation stability. |
-| `path_presentation.test.cjs` | Score formatting, saved metrics, units, direction, tooltips, concise difference labels, and component probability formatting (including unavailable values). |
-| `path_fixtures.cjs` | Shared graph/occurrence factories, not tests. Each call returns fresh mutable data. |
+| `path_diagram.test.cjs` | Component metadata, patch variants, token labels, and SVG text wrapping. |
+| `path_exploration.test.cjs` | Path provenance, identities, selection, sorting, and stable graph lanes. |
+| `path_inspector.test.cjs` | Path Inspector integration: navigation, selection, comparisons, scores, filtering, state management, component decoding, and information popovers. |
+| `path_inspector_layout.test.cjs` | Browser-based layout validation: responsive sizing, scrolling, navigation, histogram readability, probability labels, and popover behavior. |
+| `path_presentation.test.cjs` | Score and probability formatting, metric descriptions, tooltips, and path difference labels. |
+| `path_fixtures.cjs` | Shared graph and occurrence factories for tests (not a test file). |
 
 ### Python tests
 
 | File | Coverage |
 | --- | --- |
-| `test_component_logit_lens.py` | MLP/head decoding, clean-row/position and softmax contracts, activation validation, hook safety, live caching/retries and job isolation, diagnostics, and JSON scrubbing of invalid readout probabilities. |
-| `test_experiment.py` | Experiment validation, root/metric/algorithm setup, saving, and algorithm × strategy × metric execution. Loads GPT-2. |
-| `test_joint_scoring.py` | Cached tree messages, incremental evaluation, isolated versus joint candidate scores, and simultaneous admission. Loads GPT-2. |
-| `test_nodes.py` | Node forward messages, patching, expansion candidates, and gradients. Loads GPT-2 and Qwen. |
-| `test_path_provenance.py` | Original path/occurrence identity, duplicate Q/K/V display routes, merged tree diamonds, root-only/incomplete trees, signed scores and search filtering, scoring modes, occurrence deduplication/shared references, and completed search payloads. |
+| `test_component_logit_lens.py` | MLP/head decoding, token positions, full-vocabulary probabilities, activation validation, caching, hook safety, error handling, and Top-9 readouts. |
+| `test_experiment.py` | Experiment validation, setup, saving, and algorithm × strategy × metric execution. Loads GPT-2. |
+| `test_joint_scoring.py` | Cached tree messages, incremental evaluation, isolated/joint scoring, and simultaneous admission. Loads GPT-2. |
+| `test_nodes.py` | Node messages, patching, expansion candidates, and gradients. Loads GPT-2 and Qwen. |
+| `test_path_provenance.py` | Original path identities, Q/K/V occurrences, tree merging, scoring modes, search results, and serialization, including Top-9 configuration. |
 
 The `benchmark/Automatic-Circuit-Discovery` submodule contains its own upstream tests, which are not included in this suite.
 
@@ -77,6 +79,6 @@ Run a specific test file:
 ```bash
 python -m pytest test/test_component_logit_lens.py -v
 ```
-*Replace `test_component_logit_lens.py` with the desired filename to run the other visualization tests individually.*  
+*Replace `test_component_logit_lens.py` with the desired filename to run the other Python tests individually.*
 
 The `-v` option displays the results of individual test cases.

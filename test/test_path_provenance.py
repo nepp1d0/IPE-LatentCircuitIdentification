@@ -256,8 +256,8 @@ def test_completed_payload_keeps_provenance_through_enrichment_and_scrubbing(
     monkeypatch.setattr(server, "evaluate_tree", lambda *args: 999.0)
 
     class Lens:
-        def __init__(self, *args):
-            pass
+        def __init__(self, *args, top_k=5):
+            assert top_k == 9
 
         def enrich(self, graph, **kwargs):
             for node in graph["nodes"]:

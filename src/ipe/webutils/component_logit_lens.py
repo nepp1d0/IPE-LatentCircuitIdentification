@@ -321,18 +321,20 @@ def decode_circuit_components(
 
 
 class LiveComponentLogitLens:
-	"""Job-local activation preparation and on-demand top-5 memoization.
+	"""Job-local activation preparation and on-demand top-k memoization.
 
 	Retain clean hook_mlp_out and hook_z activations; heads use W_O[head].
 	Prepare before installing search hooks (especially ACDC's patching hooks).
 	Live enrichment never runs a forward pass or resets hooks. Only discovered
 	components are unembedded, once per component/position; repeated events and
 	the completed graph reuse the same isolated-component softmax readouts.
+	The retained top_k is fixed per instance (default 5; the IPE histogram uses 9).
 	"""
 
-	def __init__(self, model, clean_prompt: str, activation_cache=None):
+	def __init__(self, model, clean_prompt: str, activation_cache=None, *, top_k: int = 5):
 		self.model = model
 		self.clean_prompt = clean_prompt
+		self.top_k = top_k
 		self.activations = {}
 		self.readouts = {}
 		self.token_cache = {}
@@ -406,6 +408,7 @@ class LiveComponentLogitLens:
 				decode_circuit_components(
 					self.model, {"nodes": list(pending.values())}, self.clean_prompt,
 					activation_cache=self.activations, allow_forward=final,
+					top_k=self.top_k,
 					_prompt=self.prompt, _token_cache=self.token_cache,
 				)
 			if final:

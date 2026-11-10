@@ -202,15 +202,35 @@
 		<p id="path-score-context" hidden></p>
 		<div id="path-list" role="group" aria-label="Original discovered paths" aria-describedby="path-score-context"></div>
 		<section id="selected-path-details" hidden aria-labelledby="selected-path-heading">
-			<h3 id="selected-path-heading">Selected path components</h3>
-			<div id="selected-path-meta"></div>
-			<div id="selected-path-diagram" tabindex="0" aria-label="Selected path diagram, independently scrollable"></div>
+			<div class="path-component-layout">
+				<div class="path-component-section">
+					<h3 id="selected-path-heading">Selected path components</h3>
+					<div id="selected-path-meta"></div>
+					<div id="selected-path-diagram" tabindex="0" aria-label="Selected path diagram, independently scrollable"></div>
+				</div>
+				<section id="component-decoding" class="path-component-section" aria-labelledby="component-decoding-heading">
+					<div class="component-decoding-header">
+						<h3 id="component-decoding-heading">Component Decoding</h3>
+						<div id="component-decoding-info-wrap">
+							<button id="component-decoding-info" type="button" aria-label="About Component Decoding" aria-expanded="false" aria-controls="component-decoding-info-popover" aria-describedby="component-decoding-info-popover">ⓘ</button>
+							<div id="component-decoding-info-popover" role="note" hidden>
+								<strong>About Component Decoding</strong>
+								<p>The chart shows the top tokens obtained by projecting the selected component's output into the vocabulary space using a logit lens.</p>
+								<p>For attention heads, the full output at the query position is decoded, rather than the isolated message of the selected path.</p>
+								<p>Token positions are zero-based and include BOS. Token labels refer to the first clean prompt: ␠ indicates a space, ⇥ a tab, and ↵ a newline.</p>
+							</div>
+						</div>
+					</div>
+					<div id="component-decoding-content" tabindex="0" aria-live="polite" aria-atomic="true" aria-label="Selected component decoding, independently scrollable"></div>
+				</section>
+			</div>
 		</section>
 	</aside>
 </div>
 <script src="/static/path_exploration.js"></script>
 <script src="/static/path_presentation.js"></script>
 <script src="/static/path_diagram.js"></script>
+<script src="/static/component_decoding.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

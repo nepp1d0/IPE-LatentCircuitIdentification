@@ -189,6 +189,29 @@ def test_live_events_and_final_graph_reuse_readouts(monkeypatch):
 	assert repeated["nodes"][0]["component_logit_lens"] is nodes[0]["component_logit_lens"]
 
 
+@pytest.mark.parametrize("kind", ["attn", "mlp"])
+def test_live_top_nine_reuses_the_existing_decoder_and_full_vocabulary_probabilities(kind):
+	model = FakeModel()
+	# Keep vocabulary mass outside the displayed nine tokens.
+	model.projection = torch.cat((model.projection, torch.full((3, 2), -2.0)), dim=1)
+	cache = {"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": model.z}
+	lens = LiveComponentLogitLens(model, "clean prompt", cache, top_k=9)
+	node = {"id": "component", "kind": kind, "layer": 0, "head": 0, "position": 4}
+	lens.enrich({"nodes": [node]})
+	readout = node["component_logit_lens"]
+	logits = model.projection[0] if kind == "attn" else model.projection.sum(dim=0)
+	expected = torch.softmax(logits.float(), dim=-1).topk(9).values
+	assert len(readout["top_tokens"]) == 9
+	assert [t["probability"] for t in readout["top_tokens"]] == pytest.approx(expected.tolist())
+	assert sum(t["probability"] for t in readout["top_tokens"]) < 1
+	assert readout["position"] == 4 and readout["position_token"] == PROMPT_TOKENS[4]
+	repeated = {"nodes": [dict(node, id="another-occurrence")]}
+	lens.enrich(repeated, final=True)
+	assert repeated["nodes"][0]["component_logit_lens"] is readout
+	assert model.run_count == 0
+
+
 def test_live_acdc_snapshots_use_last_position_and_are_job_local():
 	model = FakeModel()
 	cache = {
@@ -518,6 +541,32 @@ def test_live_readouts_share_q_kv_payloads_but_remain_job_local():
 	other = graph("Q")
 	LiveComponentLogitLens(model2, "other saved prompt", cache2).enrich(other)
 	assert other["nodes"][0]["component_logit_lens"] != q["nodes"][0]["component_logit_lens"]
+	model.run_with_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("position", [0, 1, None])
+@pytest.mark.parametrize("kv_position", [0, 1, None])
+def test_inspector_readouts_use_query_not_kv_and_keep_full_vocabulary_softmax(position, kv_position):
+	model, cache, weights = _make_readout_contract()
+	lens = LiveComponentLogitLens(model, "first clean prompt", cache)
+	node = dict(id="head", kind="attn", layer=0, head=0, position=position,
+		kv_position=kv_position, variant="KV")
+	graph = {"nodes": [node], "edges": []}
+	lens.enrich(graph, final=True)
+	readout = node["component_logit_lens"]
+	query = 2 if position is None else position
+	probabilities = torch.softmax((cache["blocks.0.attn.hook_z"][0, query, 0] / 2 @ weights).float(), -1)
+	expected, _ = probabilities.topk(5)
+	assert readout["position"] == query
+	assert readout["position_token"] == f" token{query}"
+	assert [item["probability"] for item in readout["top_tokens"]] == pytest.approx(expected.tolist())
+	assert sum(item["probability"] for item in readout["top_tokens"]) < 1
+	# Switching occurrences/patch streams reuses this component-position payload.
+	other = dict(node, id="another-occurrence", kv_position=None, variant="Q")
+	count = model.unembed.call_count
+	lens.enrich({"nodes": [other]})
+	assert other["component_logit_lens"] is readout
+	assert model.unembed.call_count == count
 	model.run_with_cache.assert_not_called()
 
 

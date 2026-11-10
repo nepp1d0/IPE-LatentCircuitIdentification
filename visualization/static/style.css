@@ -197,6 +197,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 }
 #path-explorer {
 	grid-area: paths;
+	container: path-inspector / inline-size;
 	position: relative;
 	display: flex;
 	flex-direction: column;
@@ -274,6 +275,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 #path-list .path-select[aria-pressed="true"] { border-color: var(--accent); border-left-color: var(--accent); }
 #path-list .path-select:focus-visible, #path-clear:focus-visible, #path-info:focus-visible, #path-resize-handle:focus-visible,
 #selected-path-diagram:focus-visible, #path-sort-toggle:focus-visible, .path-sort-option:focus-visible,
+#component-decoding-content:focus-visible,
+#component-decoding-info:focus-visible,
+.component-decoding-plot:focus-visible,
 .path-difference-details summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .path-card-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .path-card-heading strong { font-weight: 600; }
@@ -284,16 +288,62 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .path-difference-details { font-size: 11px; padding: 3px 6px; }
 .path-difference-details summary { cursor: pointer; color: var(--ink-2); }
 .path-difference-details ul { padding-left: 16px; overflow-wrap: anywhere; }
-#selected-path-details { display: flex; flex: 1 1 55%; flex-direction: column; min-height: 160px;
+#selected-path-details { display: flex; flex: 1 1 55%; flex-direction: column; min-height: 400px;
 	border-top: 1px solid var(--grid-hair); margin-top: 10px; padding-top: 8px; }
-#selected-path-heading { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+.path-component-layout { display: grid; flex: 1; min-height: 0; min-width: 0; gap: 12px;
+	grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(110px, 0.65fr) minmax(250px, 1fr); }
+.path-component-section { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#selected-path-heading, #component-decoding-heading { flex: none; font-size: 13px; font-weight: 600; margin: 0 0 4px; }
 #selected-path-meta { font-size: 11px; color: var(--ink-2); overflow-wrap: anywhere; }
-#selected-path-diagram { overflow: auto; min-height: 0; margin-top: 6px; overscroll-behavior: contain; }
-#selected-path-diagram svg { display: block; }
-.path-component-name { font-size: 12px; font-weight: 600; fill: var(--ink-1); }
-.path-component-meta { font-size: 10px; fill: var(--ink-2); }
+#selected-path-diagram { flex: 1; overflow: auto; min-height: 0; margin-top: 6px; overscroll-behavior: contain; }
+#selected-path-diagram svg { display: block; width: 100%; max-width: 268px; height: auto; }
+.path-component[role="button"] { cursor: pointer; outline: none; }
+.path-component-hit { fill: transparent; stroke: transparent; stroke-width: 1; }
+.path-component[role="button"]:hover .path-component-hit { fill: var(--page); }
+.path-component[aria-pressed="true"] .path-component-hit { fill: var(--page); stroke: var(--accent); }
+.path-component[role="button"]:focus-visible .path-component-hit { stroke: var(--accent); stroke-width: 2; }
+/* Keep labels readable when the SVG scales into a compact Inspector column. */
+.path-component-name { font-size: 14px; font-weight: 600; fill: var(--ink-1); }
+.path-component-meta { font-size: 12px; fill: var(--ink-2); }
 .path-component-token { fill: var(--ink-muted); font-weight: 400; }
 .path-token-context { margin: 0 0 6px; color: var(--ink-2); font-size: 10px; }
+#component-decoding { border-top: 1px solid var(--grid-hair); padding-top: 8px; }
+.component-decoding-header { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 4px; margin-bottom: 4px; }
+.component-decoding-header #component-decoding-heading { margin: 0; }
+#component-decoding-info-wrap { position: relative; flex: none; }
+#path-explorer #component-decoding-info { display: grid; place-items: center; width: 22px; height: 22px; padding: 0;
+	border-color: transparent; background: transparent; color: var(--ink-2); font-size: 14px; border-radius: 50%; }
+#path-explorer #component-decoding-info:hover, #path-explorer #component-decoding-info[aria-expanded="true"] { color: var(--ink-1); border-color: var(--baseline); background: var(--page); }
+#component-decoding-info-wrap #component-decoding-info-popover { bottom: calc(100% + 8px); right: 0;
+	width: 280px; max-width: calc(100vw - 32px); max-height: min(240px, 60vh); overflow-y: auto; overscroll-behavior: contain; }
+#component-decoding-info-wrap #component-decoding-info-popover[data-side="below"] { bottom: auto; top: calc(100% + 8px); }
+#component-decoding-info-popover p { margin: 6px 0 0; }
+#component-decoding-content { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+#component-decoding-content p { flex: none; margin: 0 0 5px; overflow-wrap: anywhere; }
+.component-decoding-position { max-height: 3em; overflow: auto; }
+#component-decoding-content > .component-decoding-note { max-height: 3em; overflow: auto; }
+.component-decoding-name { font-size: 12px; font-weight: 600; }
+.component-decoding-position, .component-decoding-empty { color: var(--ink-2); font-size: 11px; }
+.component-decoding-note, .component-decoding-scale, .component-decoding-disclaimer { color: var(--ink-2); font-size: 10px; line-height: 1.4; }
+#component-decoding-content > .component-decoding-disclaimer { margin: 5px 0 0; }
+/* Fit the token rows naturally; shrink only when independent scrolling is needed. */
+.component-decoding-chart { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 75px; }
+.component-decoding-plot { flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.component-decoding-bars, .component-decoding-axis { display: block; flex: none; }
+.component-decoding-axis { background: var(--surface-1); }
+.component-decoding-token { font: 11px ui-monospace, monospace; fill: var(--ink-1); }
+.component-decoding-probability { font: 11px ui-monospace, monospace; fill: var(--ink-1); font-variant-numeric: tabular-nums; }
+.component-decoding-probability.inside { fill: #fff; }
+.component-decoding-bar { fill: var(--pos); }
+.component-decoding-gridline { stroke: var(--grid-hair); stroke-width: 1; }
+.component-decoding-axis-line { stroke: var(--baseline); stroke-width: 1; }
+.component-decoding-tick { font-size: 11px; fill: var(--ink-2); font-variant-numeric: tabular-nums; }
+.component-decoding-axis-title { font-size: 11px; fill: var(--ink-2); }
+@container path-inspector (min-width: 440px) {
+	#selected-path-details { min-height: 270px; }
+	.path-component-layout { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+	#component-decoding { border-top: none; border-left: 1px solid var(--grid-hair); padding-top: 0; padding-left: 12px; }
+}
 
 /* ---------------------------------------------------------------- legend */
 #legend .legend-row {
@@ -441,7 +491,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 }
 
 /* ---------------------------------------------------------------- tooltip */
-#tooltip, #path-info-popover {
+#tooltip, #path-info-popover, #component-decoding-info-popover {
 	position: absolute;
 	max-width: 320px;
 	background: var(--surface-1);
@@ -467,7 +517,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 	/* Clear removes .exploring-paths; keep the parameter column the same size. */
 	#app { grid-template-columns: 280px minmax(0, 1fr); }
 	#app.exploring-paths { grid-template: "topbar topbar" 52px "sidebar main" minmax(280px, 1fr) "sidebar paths" minmax(300px, 1fr) / 280px minmax(0, 1fr); }
-	#path-explorer { border-left: none; border-top: 1px solid var(--grid-hair); }
+	#path-explorer { overflow-y: auto; border-left: none; border-top: 1px solid var(--grid-hair); }
 	#path-resize-handle { display: none; }
 }
 @media (max-width: 680px) {

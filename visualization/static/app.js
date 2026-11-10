@@ -45,6 +45,7 @@ const state = {
 	hover: null,
 	pathExplorer: null,          // completed-result provenance; independent of hover/cache
 	pathEntries: new Map(),     // sidebar DOM references, separate from cached result data
+	componentSelection: null,  // {path, index}; local to the summary, never graph selection
 	admitQueue: [],          // incoming admit events, revealed one by one
 	fresh: new Map(),        // node id -> reveal timestamp (drives the pulse)
 };
@@ -294,6 +295,19 @@ function setPathInfoOpen(open, pinned = false) {
 	$("#path-info").dataset.pinned = String(open && pinned);
 }
 
+function setComponentDecodingInfoOpen(open) {
+	const popover = $("#component-decoding-info-popover"), info = $("#component-decoding-info");
+	if (open) {
+		const button = info.getBoundingClientRect(), panel = $("#path-explorer").getBoundingClientRect();
+		const above = button.top - Math.max(0, panel.top) - 8;
+		const below = Math.min(window.innerHeight, panel.top + panel.height) - button.top - button.height - 8;
+		popover.dataset.side = below > above ? "below" : "above";
+		popover.style.maxHeight = `${Math.max(0, Math.min(240, window.innerHeight * 0.6, Math.max(above, below)))}px`;
+	}
+	popover.hidden = !open;
+	info.setAttribute("aria-expanded", String(open));
+}
+
 function focusPathSortOption(option) {
 	for (const item of $("#path-sort").querySelectorAll("button")) item.tabIndex = item === option ? 0 : -1;
 	option?.focus({ preventScroll: true });
@@ -415,13 +429,37 @@ function updateSelectedPathDiagram(path) {
 	$("#selected-path-meta").textContent = path ? `Path ${path.ordinal}` : "";
 	const diagram = $("#selected-path-diagram");
 	const changed = diagram.dataset.pathId !== (path?.id || "");
+	if (changed || !path) setComponentDecodingInfoOpen(false);
+	if (!path || state.componentSelection?.path !== path) state.componentSelection = null;
 	PathDiagram.render(diagram, path, {
 		name: PathExploration.componentName, variant: PathExploration.patchVariant,
 		meta: state.result?.meta,
 		occurrences: state.result?.graph?.path_provenance?.occurrences,
+		selectedIndex: state.componentSelection?.index,
+		onSelect: (index) => selectPathComponent(path, index),
 	});
 	diagram.dataset.pathId = path?.id || "";
 	if (changed) diagram.scrollTop = 0;
+	updateComponentDecoding();
+}
+
+function updateComponentDecoding() {
+	const selection = state.componentSelection;
+	const component = selection?.path.components[selection.index];
+	const nodeId = selection?.path.sequence[selection.index];
+	const node = state.result?.graph.nodes.find((n) => n.id === nodeId);
+	const container = $("#component-decoding-content");
+	ComponentDecoding.render(container, { component, node, meta: state.result?.meta,
+		name: PathExploration.componentName });
+	container.scrollTop = 0;
+}
+
+function selectPathComponent(path, index) {
+	if (!path || state.pathExplorer?.index.paths.get(state.pathExplorer.selectedId) !== path
+		|| !Number.isInteger(index) || !path.components[index]) return;
+	state.componentSelection = { path, index };
+	PathDiagram.select($("#selected-path-diagram"), index);
+	updateComponentDecoding();
 }
 
 function updatePathSelectionControls(scrollSelected = false) {
@@ -816,7 +854,7 @@ function onHoverNode(n, ev) {
 		if (!lens || lens.available !== true) {
 			rowsOut.push(`<span class="tt-dim">Readout unavailable for this component.</span>`);
 		} else {
-			for (const [index, item] of (lens.top_tokens || []).entries()) {
+			for (const [index, item] of (lens.top_tokens || []).slice(0, 5).entries()) {
 				const rank = Number.isInteger(item.rank) ? item.rank : index + 1;
 				rowsOut.push(`${rank}. <code>${escapeHtml(visibleToken(item.token ?? ""))}</code>: <b>${escapeHtml(fmtProbability(item.probability))}</b>`);
 			}
@@ -910,6 +948,21 @@ function setupPanZoom() {
 function setupPathInspector() {
 	const app = $("#app"), panel = $("#path-explorer"), handle = $("#path-resize-handle");
 	const info = $("#path-info"), infoWrap = $("#path-info-wrap");
+	const decodingInfo = $("#component-decoding-info"), decodingInfoWrap = $("#component-decoding-info-wrap");
+	decodingInfo.addEventListener("click", () => {
+		setPathInfoOpen(false);
+		setPathSortOpen(false);
+		setComponentDecodingInfoOpen($("#component-decoding-info-popover").hidden);
+	});
+	decodingInfoWrap.addEventListener("focusout", (event) => {
+		if (!decodingInfoWrap.contains(event.relatedTarget)) setComponentDecodingInfoOpen(false);
+	});
+	const repositionDecodingInfo = () => {
+		if (!$("#component-decoding-info-popover").hidden) setComponentDecodingInfoOpen(true);
+	};
+	panel.addEventListener("scroll", repositionDecodingInfo);
+	window.addEventListener("scroll", repositionDecodingInfo);
+	window.addEventListener("resize", repositionDecodingInfo);
 	const sortToggle = $("#path-sort-toggle"), sortWrap = $("#path-sort-wrap");
 	const sortOptions = [...$("#path-sort").querySelectorAll("button")];
 	sortToggle.addEventListener("click", () => setPathSortOpen($("#path-sort-popover").hidden, true));
@@ -953,11 +1006,16 @@ function setupPathInspector() {
 		setPathInfoOpen(open, open);
 	});
 	document.addEventListener("pointerdown", (event) => {
+		if (!decodingInfoWrap.contains(event.target)) setComponentDecodingInfoOpen(false);
 		if (!infoWrap.contains(event.target)) setPathInfoOpen(false);
 		if (!sortWrap.contains(event.target)) setPathSortOpen(false);
 	});
 	document.addEventListener("keydown", (event) => {
 		if (event.key === "Escape") {
+			if (!$("#component-decoding-info-popover").hidden) {
+				setComponentDecodingInfoOpen(false);
+				decodingInfo.focus({ preventScroll: true });
+			}
 			setPathInfoOpen(false);
 			if (!$("#path-sort-popover").hidden) {
 				setPathSortOpen(false);

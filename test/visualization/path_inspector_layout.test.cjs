@@ -17,7 +17,14 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function graphFixture() {
 	const node = (id, kind, layer, position, head) => ({ id, kind, layer, position, head,
-		contribution: 0.5, complete: true, merged: 1, component_logit_lens: { available: false } });
+		contribution: 0.5, complete: true, merged: 1,
+		component_logit_lens: ["attn", "mlp"].includes(kind) ? {
+			available: true, convention: "isolated_component_softmax", position,
+			position_token: position === 10 ? " to" : "<BOS>",
+			top_tokens: [0.25, 0.125, 0.03125, 0.02, 0.01, 0.005, 0.002, 0.001, 1e-10, 0].map((probability, i) => ({ rank: i + 1,
+				token: i === 0 ? ' <script>window.badToken=true</script>' + "🧠LongToken".repeat(30) : ` ${id}-${i}`,
+				probability })),
+		} : { available: false } });
 	const paths = Array.from({ length: 9 }, (_, i) => ({ id: `path-${i + 1}`, complete: true,
 		node_ids: i === 8 ? ["e0", "b", "a", "m", "f"] : [i % 2 ? "e1" : "e0", "a", "m", "f"],
 		score: (i + 1) / 10, score_kind: "isolated_path_effect" }));
@@ -109,8 +116,8 @@ test("Inspector container width and Clear/header stability preserve manual circu
 			assert.equal(result.exceptionDetails, undefined, JSON.stringify(result.exceptionDetails));
 			return result.result.value;
 		};
-		const viewport = async (width) => {
-			await send("Emulation.setDeviceMetricsOverride", { width, height: 800, deviceScaleFactor: 1, mobile: false });
+		const viewport = async (width, height = 800) => {
+			await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
 			await delay(80);
 		};
 		const measure = () => evaluate(`(() => {
@@ -219,6 +226,150 @@ test("Inspector container width and Clear/header stability preserve manual circu
 			await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
 			await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
 		};
+		const decoding = () => evaluate(`(() => {
+			const content=document.querySelector('#component-decoding-content');
+			const box=n=>{const r=n.getBoundingClientRect();return [r.x,r.y,r.width,r.height];};
+			const bounds=n=>{const r=n.getBBox();return [r.x,r.y,r.width,r.height];};
+			const axis=content.querySelector('.component-decoding-axis'),svg=content.querySelector('.component-decoding-bars');
+			const plot=content.querySelector('.component-decoding-plot'),note=content.querySelector('.component-decoding-disclaimer');
+			return { text:content.textContent, values:[...content.querySelectorAll('.component-decoding-probability')].map(n=>n.textContent),
+				bars:[...content.querySelectorAll('.component-decoding-bar')].map(n=>Number(n.getAttribute('width'))),
+				probabilities:[...content.querySelectorAll('.component-decoding-row')].map(n=>Number(n.dataset.probability)),
+				axis:axis&&box(axis), content:box(content),svgWidth:svg&&Number(svg.getAttribute('width')),
+				svg:svg&&box(svg),plot:plot&&box(plot),lastBar:svg&&box(svg.querySelector('.component-decoding-row:last-child rect')),
+				note:note&&box(note),noteOverflow:note&&note.scrollHeight>note.clientHeight,
+				barBoxes:svg&&[...svg.querySelectorAll('text')].map(bounds),
+				labels:svg&&[...svg.querySelectorAll('.component-decoding-probability')].map(n=>({
+					inside:n.classList.contains('inside'),fill:getComputedStyle(n).fill,box:bounds(n),
+					bar:bounds(n.parentElement.querySelector('rect')),token:bounds(n.parentElement.querySelector('.component-decoding-token'))})),
+				outsideFill:svg&&getComputedStyle(svg.querySelector('.component-decoding-token')).fill,
+				axisBoxes:axis&&[...axis.querySelectorAll('text')].map(bounds),
+				tickBoxes:axis&&[...axis.querySelectorAll('.component-decoding-tick')].map(bounds),
+				ticks:axis&&[...axis.querySelectorAll('.component-decoding-tick')].map(n=>Number(n.textContent)),
+				grid:svg&&[...svg.querySelectorAll('.component-decoding-gridline')].map(n=>Number(n.getAttribute('x1'))),
+				tickX:axis&&[...axis.querySelectorAll('.component-decoding-tick')].map(n=>Number(n.getAttribute('x'))),
+				left:box(document.querySelector('.path-component-section')),right:box(document.querySelector('#component-decoding')),
+				heights:[document.querySelector('#selected-path-diagram').clientHeight,content.clientHeight],
+				overflow:content.scrollWidth>content.clientWidth,unsafe:content.querySelectorAll('script,img').length,
+				pressed:[...document.querySelectorAll('.path-component[aria-pressed="true"]')].map(n=>n.dataset.kind),
+				name:content.querySelector('.component-decoding-name')?.textContent };
+		})()`);
+		const assertHistogram = (d, context, count = 9) => {
+			assert.equal(d.values.length, count, context);
+			assert.equal(d.ticks[0], 0);
+			assert.ok(d.ticks.at(-1) >= d.probabilities[0], "axis never truncates the largest probability");
+			assert.deepEqual(d.grid, d.tickX, "vertical gridlines align with probability ticks");
+			assert.equal(d.overflow, false, context);
+			for (const [x, y, w, h] of d.barBoxes) {
+				assert.ok(x>=0 && x+w<=d.svgWidth+0.5, `token/value clipping: ${context} (${x}, ${w}, ${d.svgWidth})`);
+				assert.ok(y>=0 && h<=20 && y+h<=d.svg[3]+0.5, `row text fits SVG height: ${context}`);
+			}
+			for (const label of d.labels) {
+				assert.equal(label.fill, label.inside ? "rgb(255, 255, 255)" : d.outsideFill, `light inside / dark outside: ${context}`);
+				const [x, y, w, h] = label.box, [bx, by, bw, bh] = label.bar;
+				if (label.inside) assert.ok(x>=bx && x+w<=bx+bw && y>=by && y+h<=by+bh, `inside value fits its bar: ${context}`);
+				else assert.ok(x>=bx+bw+2, `short-bar value stays outside the bar: ${context}`);
+				assert.ok(x>label.token[0]+label.token[2], `value never overlaps its token label: ${context}`);
+			}
+			for (const [x, y, w, h] of d.axisBoxes) {
+				assert.ok(x>=0 && x+w<=d.svgWidth+0.5 && y>=0 && y+h<=44, `axis clipping: ${context}`);
+			}
+			for (let i=1;i<d.tickBoxes.length;i++) assert.ok(d.tickBoxes[i-1][0]+d.tickBoxes[i-1][2]<d.tickBoxes[i][0], `tick overlap: ${context}`);
+			if (d.probabilities[0] === 0) assert.ok(d.bars.every((w)=>w===0), "zero probabilities produce zero-length bars");
+			else for (let i=1;i<d.bars.length;i++) assert.ok(Math.abs(d.bars[i]/d.bars[0]-d.probabilities[i]/d.probabilities[0])<1e-9, "bars share the unmodified probability scale");
+			assert.ok(d.axis[1]>=d.content[1] && d.axis[1]+d.axis[3]<=d.content[1]+d.content[3]+0.5, `axis stays within panel: ${context}`);
+			assert.equal(d.svg[3], count*18+4, `plot height follows token count: ${context}`);
+			assert.ok(d.plot[3]<=d.svg[3]+0.5, `plot never stretches beyond its rows: ${context}`);
+			assert.ok(Math.abs(d.axis[1]-d.plot[1]-d.plot[3])<0.5, `axis directly below plot viewport: ${context}`);
+			if (d.plot[3]>=d.svg[3]) assert.ok(Math.abs(d.axis[1]-d.lastBar[1]-d.lastBar[3]-4)<0.5, `small consistent margin after last bar: ${context}`);
+			assert.ok(Math.abs(d.note[1]-d.axis[1]-d.axis[3]-5)<0.5, `note directly below histogram: ${context}`);
+			assert.ok(d.note[1]+d.note[3]<=d.content[1]+d.content[3]+0.5, `methodological note stays visible: ${context}`);
+			assert.equal(d.noteOverflow, false, `methodological note is not clipped: ${context}`);
+		};
+		assert.match((await decoding()).text, /Select a component/);
+		// Real pointer activation on the summary label, then keyboard activation.
+		const componentPoint = await evaluate(`(() => {
+			const n=document.querySelector('.path-component[data-kind="attn"]');
+			n.scrollIntoView({block:'nearest'});const r=n.querySelector('.path-component-name').getBoundingClientRect();
+			return [r.x+r.width/2,r.y+r.height/2];
+		})()`);
+		await clickAt(...componentPoint);
+		let decoded = await decoding();
+		assert.equal(decoded.name, "A5H9");
+		assert.deepEqual(decoded.values, ["0.2500", "0.1250", "0.0313", "0.0200", "0.0100", "0.0050", "0.0020", "0.0010", "1.000e-10"]);
+		assertHistogram(decoded, "default panel");
+		assert.ok(decoded.labels.some(label=>label.inside) && decoded.labels.some(label=>!label.inside), "default panel covers both value placements");
+		assert.equal(await evaluate(`document.querySelector('.component-decoding-disclaimer').textContent`),
+			"Exploratory component projection, not the full model's next-token probabilities or the selected path's causal contribution.");
+		assert.doesNotMatch(decoded.text, /Zero-based positions|⇥ tab|↵ newline/);
+		assert.match(decoded.text, /Top 9 tokens · full-vocabulary softmax/);
+		assert.deepEqual(await evaluate(`['.component-decoding-token','.component-decoding-probability','.component-decoding-tick']
+			.map(s=>getComputedStyle(document.querySelector(s)).fontSize)`), ["11px", "11px", "11px"]);
+		const expectedExplanation = [
+			"The chart shows the top tokens obtained by projecting the selected component's output into the vocabulary space using a logit lens.",
+			"For attention heads, the full output at the query position is decoded, rather than the isolated message of the selected path.",
+			"Token positions are zero-based and include BOS. Token labels refer to the first clean prompt: ␠ indicates a space, ⇥ a tab, and ↵ a newline.",
+		];
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info-popover strong').textContent`), "About Component Decoding");
+		assert.deepEqual(await evaluate(`[...document.querySelectorAll('#component-decoding-info-popover p')].map(n=>n.textContent)`), expectedExplanation);
+		await evaluate(`document.querySelector('#component-decoding-info').focus({preventScroll:true})`);
+		await pressKey("Enter", 13, "\r");
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info-popover').hidden`), false);
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info').getAttribute('aria-expanded')`), "true");
+		assert.deepEqual((await decoding()).axis, decoded.axis, "information popover must not resize the chart");
+		await pressKey("Escape", 27);
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info-popover').hidden`), true);
+		assert.equal(await evaluate(`document.activeElement.id`), "component-decoding-info");
+		await pressKey(" ", 32, " ");
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info-popover').hidden`), false);
+		await pressKey("Tab", 9);
+		assert.equal(await evaluate(`document.querySelector('#component-decoding-info-popover').hidden`), true);
+		await evaluate(`document.querySelector('.component-decoding-plot').scrollTop=10000`);
+		const scrolled = await decoding();
+		assert.deepEqual(scrolled.axis, decoded.axis, "scrolling tokens never hides or moves the axis");
+		assert.ok(Math.abs(scrolled.axis[1]-scrolled.lastBar[1]-scrolled.lastBar[3]-4)<1, "last bar sits directly above the axis after scrolling to the bottom");
+		await evaluate(`document.querySelector('.component-decoding-plot').scrollTop=0;
+			document.querySelector('#path-resize-handle').dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}))`);
+		await delay(80);
+		const wideHistogram = await decoding();
+		assertHistogram(wideHistogram, "resized without changing component");
+		assert.ok(wideHistogram.svgWidth>decoded.svgWidth, "ResizeObserver redraws the shared axis and bars");
+		await evaluate(`document.querySelector('#path-resize-handle').dispatchEvent(new MouseEvent('dblclick'))`);
+		await delay(80);
+		const originalTokens = await evaluate(`state.result.graph.nodes.find(n=>n.id==='a').component_logit_lens.top_tokens`);
+		await viewport(1440, 1200);
+		for (const count of [2, 7, 9]) {
+			await evaluate(`state.result.graph.nodes.find(n=>n.id==='a').component_logit_lens.top_tokens=${JSON.stringify(originalTokens)}.slice(0,${count});updateComponentDecoding()`);
+			const natural = await decoding();
+			assertHistogram(natural, `${count} rows with ample height`, count);
+			assert.equal(natural.plot[3], natural.svg[3], "short and full readouts use their natural height when space permits");
+		}
+		await viewport(1440);
+		for (const maximum of [0, 1e-10, 0.00011, 0.189, 0.5, 1]) {
+			await evaluate(`(() => {
+				const lens=state.result.graph.nodes.find(n=>n.id==='a').component_logit_lens;
+				const factors=${JSON.stringify(maximum === 1 ? [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+					: maximum === 0.5 ? [1, 0.98, 0.01, 0, 0, 0, 0, 0, 0, 0] : [1, 0.7, 0.55, 0.3, 0.1, 0.05, 0.01, 0.001, 1e-10, 0])};
+				lens.top_tokens=lens.top_tokens.map((item,i)=>({...item,probability:${maximum}*factors[i]}));
+				updateComponentDecoding();
+			})()`);
+			const distribution = await decoding();
+			assertHistogram(distribution, `maximum ${maximum}`);
+			if (maximum === 0.189) assert.equal(distribution.ticks.at(-1), 0.2);
+		}
+		await evaluate(`state.result.graph.nodes.find(n=>n.id==='a').component_logit_lens.top_tokens=${JSON.stringify(originalTokens)};updateComponentDecoding()`);
+		assert.deepEqual(decoded.pressed, ["attn"]);
+		assert.match(decoded.text, /Query\/output position: 10 \("␠to"\)/);
+		assert.equal(decoded.overflow, false);
+		assert.equal(decoded.unsafe, 0);
+		await evaluate(`document.querySelector('.path-component[data-kind="mlp"]').focus()`);
+		await pressKey("Enter", 13, "\r");
+		assert.equal((await decoding()).name, "MLP6");
+		assert.equal(await evaluate(`document.activeElement.dataset.kind`), "mlp");
+		await evaluate(`document.querySelector('.path-component[data-kind="attn"]').focus()`);
+		await pressKey(" ", 32, " ");
+		assert.equal((await decoding()).name, "A5H9");
+		for (const key of ["view", "selection", "geometry", "lanes"]) assert.equal((await measure())[key], initial[key], key);
 		const menuHidden = () => evaluate(`document.querySelector('#path-sort-popover').hidden`);
 		// Keyboard focus moves without sorting until Enter/Space activates a row.
 		await evaluate(`document.querySelector('#path-sort-toggle').focus()`);
@@ -306,6 +457,9 @@ test("Inspector container width and Clear/header stability preserve manual circu
 		await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: initial.panel[0] - 100, y: 240, button: "left", clickCount: 1 });
 		const resized = await measure();
 		assert.equal(resized.panel[2], 580);
+		decoded = await decoding();
+		assert.ok(decoded.right[0] > decoded.left[0] + decoded.left[2], "wide Inspector places decoding to the right");
+		assert.equal(decoded.right[1], decoded.left[1]);
 		assert.equal(resized.graph[2], initial.graph[2] - 100);
 		for (const key of ["view", "selection", "geometry", "lanes"]) assert.equal(resized[key], initial[key], key);
 		await evaluate(`document.querySelector('#path-resize-handle').dispatchEvent(new MouseEvent('dblclick'));`);
@@ -314,7 +468,7 @@ test("Inspector container width and Clear/header stability preserve manual circu
 			const container=document.querySelector('#selected-path-diagram'), svg=container.querySelector('svg');
 			const groups=[...svg.querySelectorAll('.path-component')];
 			const attention=groups.find(n=>n.dataset.kind==='attn');
-			const visible=n=>[...n.querySelectorAll('text')].map(n=>n.textContent).join(' ');
+			const visible=n=>[...n.querySelectorAll('text')].map(n=>[...n.children].map(n=>n.textContent).join(' ')).join(' ');
 			const bounds=n=>{const b=n.getBBox();return [b.x,b.y,b.width,b.height];};
 			return { attention:visible(attention), tokenLabels:[...attention.querySelectorAll('.path-component-token')].map(n=>n.textContent).join(''),
 				context:container.querySelector('.path-token-context')?.textContent,
@@ -393,6 +547,34 @@ test("Inspector container width and Clear/header stability preserve manual circu
 			assert.deepEqual((await measure()).sort, open.sort, "Sort popup must not reflow the legend");
 			await evaluate(`document.querySelector('#path-sort-toggle').click()`);
 			assertDiagramBounds(await diagram(), `${width}px`);
+			await evaluate(`document.querySelector('.path-component[data-kind="attn"]').dispatchEvent(new MouseEvent('click',{bubbles:true}))`);
+			decoded = await decoding();
+			assertHistogram(decoded, `${width}px`);
+			await evaluate(`document.querySelector('#component-decoding-info').scrollIntoView({block:'center'});
+				document.querySelector('#component-decoding-info').click()`);
+			const infoBounds = await evaluate(`(() => {
+				const n=document.querySelector('#component-decoding-info-popover'),r=n.getBoundingClientRect();
+				return {hidden:n.hidden,left:r.left,right:r.right,top:r.top,bottom:r.bottom,
+					overflow:n.scrollHeight>n.clientHeight,
+					visible:n.contains(document.elementFromPoint(r.x+r.width/2,r.y+2)) && n.contains(document.elementFromPoint(r.x+r.width/2,r.bottom-2))};
+			})()`);
+			assert.equal(infoBounds.hidden, false);
+			assert.ok(infoBounds.left>=0 && infoBounds.right<=width && infoBounds.top>=0 && infoBounds.bottom<=800,
+				`decoding information outside viewport at ${width}px: ${JSON.stringify(infoBounds)}`);
+			assert.equal(infoBounds.visible, true, `decoding information clipped at ${width}px`);
+			if (infoBounds.overflow) {
+				await evaluate(`document.querySelector('#component-decoding-info-popover').scrollTop=0`);
+				await send("Input.dispatchMouseEvent", { type: "mouseWheel", x: (infoBounds.left+infoBounds.right)/2,
+					y: (infoBounds.top+infoBounds.bottom)/2, deltaX: 0, deltaY: 500 });
+				await delay(80);
+				const scrollState = await evaluate(`(() => {const n=document.querySelector('#component-decoding-info-popover');return {hidden:n.hidden,scrollTop:n.scrollTop,height:n.clientHeight,scrollHeight:n.scrollHeight};})()`);
+				assert.ok(!scrollState.hidden && scrollState.scrollTop>0,
+					`long explanation remains open and scrollable at ${width}px: ${JSON.stringify({infoBounds,scrollState})}`);
+			}
+			await pressKey("Escape", 27);
+			assert.equal(decoded.overflow, false, `decoding horizontal overflow at ${width}px`);
+			assert.ok(decoded.heights.every((h)=>h>0), `both plots have usable scroll areas at ${width}px`);
+			if (decoded.right[0] === decoded.left[0]) assert.ok(decoded.right[1] >= decoded.left[1] + decoded.left[3], "narrow sections stack");
 			assert.equal(open.view, initial.view, "opening the Inspector must not reset manual pan/zoom");
 			await evaluate(`document.querySelector('#path-clear').click();render()`);
 			const closed = await measure();
