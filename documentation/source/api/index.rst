@@ -19,3 +19,5 @@ API reference for the project's codebase.
    Model <webutils/model>
    Nodes <nodes>
    Paths <paths>
+   Serialization <webutils/serialization>
+   Component Logit Lens <webutils/component_logit_lens>

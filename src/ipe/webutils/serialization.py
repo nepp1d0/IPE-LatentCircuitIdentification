@@ -16,6 +16,7 @@ and the merged variants listed in the node's metadata.
 
 from collections import Counter
 import math
+from torch import Tensor
 
 from ipe.nodes import Node, EMBED_Node, MLP_Node, ATTN_Node, FINAL_Node
 
@@ -69,7 +70,8 @@ def node_to_dict(n: Node) -> dict:
 
 def _subtree_reaches_embed(n: Node, memo: dict) -> bool:
 	"""True if some root->leaf branch through `n` ends at an EMBED node, i.e. the
-	branch is complete rather than pruned mid-way."""
+    branch is complete rather than pruned mid-way.
+    """
 	if id(n) in memo:
 		return memo[id(n)]
 	if isinstance(n, EMBED_Node):
@@ -82,7 +84,8 @@ def _subtree_reaches_embed(n: Node, memo: dict) -> bool:
 
 class _GraphAccumulator:
 	"""Accumulates (parent, child) links of tree nodes / path elements into the
-	collapsed grid DAG, merging by grid identity."""
+    collapsed grid DAG, merging by grid identity.
+    """
 
 	def __init__(self):
 		self.nodes: dict[str, dict] = {}
@@ -142,20 +145,42 @@ class _GraphAccumulator:
 
 
 class _PathProvenance:
-	"""Snapshot original occurrences, never routes through the collapsed DAG.
+	"""Store the original paths and node occurrences discovered
+    during circuit search.
 
-	Sequences are in data-flow order (embedding -> root). Occurrence IDs refer
-	to original Node objects, whereas node_ids refer to merged grid identities.
-	Distinct occurrences may have identical grid IDs but different Q/K/V reads.
-	"""
+    Paths follow the data-flow direction, from embedding to root.
+    Original node occurrences are kept separate even when they
+    correspond to the same node in the merged graph.
+    """
 
-	def __init__(self, source: str, order: str):
+	def __init__(self, source: str, order: str) -> None:
+		"""Initialize the structure used to store path provenance.
+
+        Args:
+            source (str):
+                The search method, either 'tree' or 'path'.
+            order (str):
+                The ordering label used for stored paths, either 'discovery' or 'tree'/'result'.
+        """
 		self.source = source
 		self.order = order
 		self.occurrences: dict[int, dict] = {}
 		self.paths: list[dict] = []
 
-	def add(self, path: list[Node], score=None, *, score_kind: str = "unknown") -> None:
+	def add(self, path: list[Node], score: float | Tensor | None = None, *, score_kind: str = "unknown") -> None:
+		"""Store an original path and its node occurrences, preserving
+        their original identities.
+
+        Args:
+            path (list[Node]):
+                The path nodes ordered from embedding to root.
+            score (float or torch.Tensor, optional):
+                The path score, stored only for complete paths
+                with finite values. Defaults to None.
+            score_kind (str, optional):
+                The type of score associated with the path.
+                Defaults to 'unknown'.
+        """
 		complete = bool(path and isinstance(path[0], EMBED_Node))
 		value = float(score) if complete and score is not None else None
 		if value is not None and not math.isfinite(value):
@@ -182,6 +207,13 @@ class _PathProvenance:
 		})
 
 	def to_dict(self) -> dict:
+		"""Convert the stored path provenance into a dictionary.
+
+        Returns:
+            dict:
+                The provenance information, including its version,
+                source, ordering label, node occurrences and paths.
+        """
 		return {
 			"version": 1,
 			"source": self.source,
@@ -191,8 +223,19 @@ class _PathProvenance:
 		}
 
 
-def _tree_child_order(n: Node) -> tuple:
-	"""Prefer admission order; legacy trees use component order, not scores."""
+def _tree_child_order(n: Node) -> tuple[int | float, str, str, int]:
+	"""Create a key to order tree nodes based on their
+    discovery index and component information.
+
+    Args:
+        n (Node):
+            The tree node to order.
+
+    Returns:
+        tuple[int | float, str, str, int]:
+            The discovery index, grid ID, attention variant
+            and key/value position.
+    """
 	kv = getattr(n, "keyvalue_position", None)
 	return (getattr(n, "discovery_index", float("inf")), grid_id(n),
 			attn_variant(n) if isinstance(n, ATTN_Node) else "",
@@ -200,19 +243,43 @@ def _tree_child_order(n: Node) -> tuple:
 
 
 def graph_from_tree(root: Node, *, joint_scoring: bool | None = None) -> dict:
-	"""Collapse the tree grown by TreeMessagePatching* into the grid DAG.
+	"""Convert the discovered tree into a merged graph, preserving
+    the original paths and their provenance.
 
-	Nodes on branches that were pruned before reaching the embeddings are marked
-	`complete: false` (unless they also lie on a complete branch) so the frontend
-	can render them differently. Complete branches retain their original terminal
-	embedding's admission score. The caller must identify the search's scoring
-	mode: None keeps legacy/unknown scores distinct from isolated path effects.
-	No contributions are evaluated here."""
+    The function traverses the tree, collects its branches and
+    identifies which ones reach an embedding node. The resulting
+    graph includes the merged components and their connections,
+    together with the original path information.
+
+    Args:
+        root (Node):
+            The root node of the discovered tree.
+        joint_scoring (bool, optional):
+            The scoring mode used during the search.
+            True indicates joint scoring, False indicates isolated
+            path scoring, and None indicates an unknown mode. Defaults to None.
+
+    Returns:
+        dict:
+            The merged graph containing 'nodes' and 'edges',
+            together with 'path_provenance' describing the
+            original paths and their scores.
+    """
 	acc = _GraphAccumulator()
-	memo: dict = {}
+	memo: dict[int, bool] = {}
 	branches = []
 
 	def walk(n: Node, ancestors: list[Node]) -> None:
+		"""Traverse the tree to collect its nodes, edges and
+        original paths.
+
+        Args:
+            n (Node):
+                The current node in the tree.
+            ancestors (list[Node]):
+                The nodes visited along the path from the root
+                to the current node.
+        """
 		branch = ancestors + [n]
 		if not n.children:
 			branches.append(list(reversed(branch)))
@@ -237,10 +304,25 @@ def graph_from_tree(root: Node, *, joint_scoring: bool | None = None) -> dict:
 	return {**acc.to_dict(), "path_provenance": provenance.to_dict()}
 
 
-def graph_from_paths(paths: list[tuple[float, list[Node]]]) -> dict:
-	"""Collapse PathMessagePatching* results (score, [leaf, ..., root]) into the
-	grid DAG. Original whole-path scores stay separate from the merged nodes'
-	branch-admission scores (or path-score fallbacks for legacy nodes)."""
+def graph_from_paths(paths: list[tuple[float | Tensor | None, list[Node]]]) -> dict:
+	"""Convert scored paths into a grid graph while retaining their provenance.
+
+    Each path is added to the graph, merging components with the
+    same grid identity. Original path scores are stored separately,
+    while missing node contributions can be filled using the
+    corresponding path score.
+
+    Args:
+        paths (list[tuple[float | torch.Tensor | None, list[Node]]]):
+            The discovered paths and their associated scores,
+            with nodes ordered from embedding to root.
+
+    Returns:
+        dict:
+            The merged graph containing 'nodes' and 'edges',
+            together with 'path_provenance' describing the
+            original paths and their scores.
+    """
 	acc = _GraphAccumulator()
 	has_order = all(path and hasattr(path[0], "discovery_index") for _, path in paths)
 	ordered = sorted(paths, key=lambda item: item[1][0].discovery_index) if has_order else paths

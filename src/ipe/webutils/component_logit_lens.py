@@ -1,48 +1,79 @@
 """Component Logit Lens for circuit visualization.
 
-MLP outputs come from hook_mlp_out. Individual attention head outputs
-are reconstructed from hook_z through W_O[head], without the shared b_O.
-These residual-space vectors are decoded using final layer normalization
-and unembedding.
+MLP outputs are obtained from hook_mlp_out, while attention head outputs
+are reconstructed from hook_z using W_O[head], without the shared b_O bias.
+These residual-space vectors are then decoded using the final layer
+normalization and unembedding.
 
-For each component, it extracts the activation at the selected token
-position and computes the top-k tokens with their corresponding softmax
-probabilities.
+For each component, the activation at the selected token position is
+used to compute the softmax probabilities and extract the top-k tokens
+with the highest probabilities.
 
-Readouts use clean-prompt activations independently of the search's
-patching contribution values.
+All readouts are computed using clean-prompt activations, independently
+of the patching contribution scores used during circuit discovery.
 
-The module also supports live circuit discovery by reusing cached
-activations and storing previously computed readouts, avoiding
-unnecessary recomputation as new nodes are discovered.
+The resulting readouts represent isolated component outputs, rather than
+the model's final predictions or direct logit attributions.
 
-Note that these readouts represent isolated component outputs,
-not the model's final predictions or direct logit attributions.
+During live circuit discovery, cached activations and previously computed
+readouts are reused to avoid unnecessary computations.
 """
 
 from __future__ import annotations
-
 import logging
 from functools import lru_cache
-
+from typing import TYPE_CHECKING, cast
 import torch
 
+if TYPE_CHECKING:
+	from transformer_lens import ActivationCache, HookedTransformer
+	from transformer_lens.components.transformer_block import TransformerBlock
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=256)
-def _diagnostic(message: str):
-	"""Bound repeated diagnostics, including repeated live/final events."""
+def _diagnostic(message: str) -> None:
+	"""Log a warning message, avoiding repeated logs for the
+    same message.
+
+    Args:
+        message (str):
+            The diagnostic text to log with the 'Component Logit Lens' prefix.
+    """
 	logger.warning("Component Logit Lens: %s", message)
 
 
-def _failure(node, stage, exc):
+def _failure(node: dict, stage: str, exc: Exception) -> None:
+	"""Log an error related to a circuit component,
+    including its identifier and the operation that failed.
+
+    Args:
+        node (dict):
+            The component where the error occurred.
+        stage (str):
+            The operation in which the error occurred.
+        exc (Exception):
+            The exception that caused the error.
+    """
 	identifier = node.get("id", (node.get("kind"), node.get("layer"), node.get("head")))
 	_diagnostic(f"{identifier}: {stage}: {type(exc).__name__}: {exc}")
 
 
-def _cache_get(cache, name: str):
+def _cache_get(cache: dict | ActivationCache | None, name: str) -> object | None:
+	"""Retrieve an activation from the cache, if it exists, using its hook name.
+
+    Args:
+        cache (dict or ActivationCache or None):
+            The cache containing the activations.
+        name (str):
+            The hook name used to retrieve the activation.
+
+    Returns:
+        object or None:
+            The cached activation, or None if the cache is missing
+            or the hook name is not found.
+    """
 	if cache is None:
 		return None
 	try:
@@ -51,8 +82,26 @@ def _cache_get(cache, name: str):
 		return None
 
 
-def _attention_hook(model, layer: int):
-	"""Validate hook_z capture and its per-head residual-space projection."""
+def _attention_hook(model: HookedTransformer, layer: int) -> str:
+	"""Identify the attention hook for the specified layer, checking
+    its availability and the shape of W_O needed to reconstruct
+    the attention head outputs.
+
+    Args:
+        model (HookedTransformer):
+            The transformer model.
+        layer (int):
+            The index of the attention layer.
+
+    Returns:
+        str:
+            The attention hook name ('blocks.{layer}.attn.hook_z').
+
+    Raises:
+        ValueError:
+            If the hook is not registered in the model
+            or W_O is not a tensor of shape (n_heads, d_head, d_model).
+    """
 	name = f"blocks.{layer}.attn.hook_z"
 	hooks = getattr(model, "hook_dict", None)
 	if hooks is not None and name not in hooks:
@@ -64,20 +113,53 @@ def _attention_hook(model, layer: int):
 	return name
 
 
-def _prompt_data(model, clean_prompt):
+def _prompt_data(model: HookedTransformer, clean_prompt: str) -> tuple[torch.Tensor, list[str]]:
+	"""Tokenize the clean prompt to obtain both token IDs and
+    their corresponding readable strings.
+
+    Args:
+        model (HookedTransformer):
+            The transformer model.
+        clean_prompt (str):
+            The clean prompt to tokenize, including the BOS token.
+
+    Returns:
+        tuple[torch.Tensor, list[str]]:
+            The token IDs of shape (1, seq_len) and their
+            corresponding readable strings.
+
+    Raises:
+        ValueError:
+            If the tokenized prompt is empty, has an invalid shape,
+            or the number of token IDs and strings does not match.
+    """
 	tokens = model.to_tokens(clean_prompt, prepend_bos=True)
 	if tokens.ndim != 2 or tokens.shape[0] != 1 or tokens.shape[1] == 0:
 		raise ValueError("Expected one non-empty, BOS-inclusive clean prompt")
-	strings = model.to_str_tokens(tokens[0], prepend_bos=False)
+	strings = cast(list[str], model.to_str_tokens(tokens[0], prepend_bos=False))
 	if len(strings) != tokens.shape[1]:
 		raise ValueError("Clean prompt token IDs and strings have different lengths")
 	return tokens, strings
 
 
-def _decode_token(model, token_id: int) -> str:
-	"""Return TransformerLens' readable token string, with a tokenizer fallback."""
+def _decode_token(model: HookedTransformer, token_id: int) -> str:
+	"""Convert a vocabulary token ID into a readable string,
+    using alternative methods if the conversion fails.
+
+    Args:
+        model (HookedTransformer):
+            The transformer model.
+        token_id (int):
+            The vocabulary token ID to convert to a string.
+
+    Returns:
+        str:
+            The decoded token string, or the token ID as a string
+            if the conversion fails.
+    """
 	try:
 		pieces = model.to_str_tokens(torch.tensor([token_id], dtype=torch.long), prepend_bos=False)
+		pieces = cast(list[str], pieces)
 		if isinstance(pieces, str):
 			return pieces
 		return str(pieces[0])
@@ -93,12 +175,46 @@ def _decode_token(model, token_id: int) -> str:
 			return str(token_id)
 
 
-def _component_vector(model, node: dict, cache, position: int, batch_index: int, *, seq_len=None):
-	"""Extract hook_mlp_out or reconstruct one head from hook_z @ W_O[head].
+def _component_vector(
+	model: HookedTransformer,
+	node: dict,
+	cache: dict | ActivationCache | tuple | list | None,
+	position: int,
+	batch_index: int,
+	*,
+	seq_len: int | None = None,
+) -> torch.Tensor:
+	"""Extract an MLP output or reconstruct the attention head output
+    in the residual space.
 
-	Caches must come from the clean prompt in batch row 0, with BOS retained
-	and right padding (the visualization/ExperimentManager convention).
-	"""
+    Args:
+        model (HookedTransformer):
+            The transformer model.
+        node (dict):
+            The component to inspect, identified by its kind and layer
+            and by its head index for attention components.
+        cache (dict or ActivationCache or tuple or list or None):
+            The cache containing the activations or multiple caches to search.
+        position (int):
+            The token position to extract, including BOS.
+        batch_index (int):
+            The batch index containing the clean prompt.
+        seq_len (int, optional):
+            The clean prompt length, including BOS. Defaults to None.
+
+    Returns:
+        torch.Tensor:
+            The component output vector in residual space, with
+            shape (d_model,).
+
+    Raises:
+        IndexError:
+            If a layer, head, or token position is outside the valid range.
+        ValueError:
+            If the component information or cached activations are invalid.
+        KeyError:
+            If required component information or activations are missing.
+    """
 	layer = int(node["layer"])
 	if not 0 <= layer < int(model.cfg.n_layers):
 		raise IndexError(f"Layer index {layer} is outside the model")
@@ -127,7 +243,8 @@ def _component_vector(model, node: dict, cache, position: int, batch_index: int,
 				raise ValueError(f"Activation shape {value.shape} does not cover batch {batch_index}, clean sequence {seq_len}, position {position}")
 			if head is None:
 				return value[batch_index, position]
-			w_o = model.blocks[layer].attn.W_O
+			block = cast("TransformerBlock", model.blocks[layer])
+			w_o = cast(torch.Tensor, block.attn.W_O)
 			z = value[batch_index, position, head].to(device=w_o.device, dtype=w_o.dtype)
 			return z @ w_o[head]
 		except Exception as exc:
@@ -138,16 +255,48 @@ def _component_vector(model, node: dict, cache, position: int, batch_index: int,
 	raise KeyError(f"Missing activations: {name}")
 
 
-def _isolated_readouts(model, vectors, top_k: int, token_cache: dict[int, str]) -> list[list[dict] | None]:
-	"""Decode component vectors in small batches and retain only their top-k."""
-	vectors = torch.stack(vectors)
-	if vectors.ndim != 2 or vectors.shape[-1] != int(model.cfg.d_model):
+def _isolated_readouts(
+	model: HookedTransformer,
+	vectors: list[torch.Tensor],
+	top_k: int,
+	token_cache: dict[int, str],
+) -> list[list[dict] | None]:
+	"""Decode isolated component vectors to obtain the top-k tokens
+    with their corresponding softmax probabilities.
+
+    Args:
+        model (HookedTransformer):
+            The transformer model.
+        vectors (list[torch.Tensor]):
+            The component vectors in residual space, each of shape (d_model,).
+        top_k (int):
+            The number of highest-probability tokens to return per vector,
+            limited to the vocabulary size.
+        token_cache (dict[int, str]):
+            A cache storing previously decoded token IDs and their strings,
+            to avoid repeated conversions.
+
+    Returns:
+        list[list[dict] | None]:
+            For each vector, a list of dictionaries containing the token
+            rank, decoded string and probability, ordered by decreasing
+            probability. Returns None for a vector if non-finite values
+            are encountered.
+
+    Raises:
+        ValueError:
+            If the vectors have an invalid shape or top_k is not positive.
+        RuntimeError:
+            If the input vectors cannot be stacked into a single tensor.
+    """
+	stacked_vectors = torch.stack(vectors)
+	if (stacked_vectors.ndim != 2 or stacked_vectors.shape[-1] != int(model.cfg.d_model)):
 		raise ValueError(f"Expected component vectors [batch, d_model={model.cfg.d_model}]")
 	if top_k < 1:
 		raise ValueError("top_k must be positive")
 	readouts = []
-	for start in range(0, vectors.shape[0], 16):
-		batch = vectors[start:start + 16]
+	for start in range(0, stacked_vectors.shape[0], 16):
+		batch = stacked_vectors[start:start + 16]
 		normalized = model.ln_final(batch)
 		logits = model.unembed(normalized)
 		probabilities = torch.softmax(logits.float(), dim=-1)
@@ -178,51 +327,61 @@ def _isolated_readouts(model, vectors, top_k: int, token_cache: dict[int, str]) 
 
 
 def decode_circuit_components(
-	model,
+	model: HookedTransformer,
 	graph: dict,
 	clean_prompt: str,
-	activation_cache=None,
+	activation_cache: dict | ActivationCache | tuple | list | None = None,
 	*,
 	top_k: int = 5,
 	allow_forward: bool = True,
-	_prompt=None,
-	_token_cache=None,
+	_prompt: tuple[torch.Tensor, list[str]] | None = None,
+	_token_cache: dict[int, str] | None = None,
 ) -> dict:
-	"""Attach isolated clean-component readouts to the existing graph nodes.
+	"""Compute the Component Logit Lens readouts for the MLP and attention
+    components in a circuit graph.
 
-	Extract hook_mlp_out for MLPs or hook_z @ W_O[head] for attention heads,
-	then apply final layer normalization, unembedding and float32 softmax.
-	These readouts are independent of patching contributions and are not the
-	model's final predictions. The shared attention bias b_O is excluded.
+    For each component, extract its output from the clean-prompt activations,
+    using cached values when available or collecting missing activations
+    through an additional forward pass if allowed. The resulting vectors
+    are then decoded to obtain the top-k tokens and their probabilities,
+    which are stored in the corresponding graph nodes.
 
-	Args:
+    The readouts are computed independently of the patching contribution
+    scores and do not represent the model's final predictions.
+
+    Args:
         model (HookedTransformer):
-            The transformer model used to extract and decode component activations.
+            The transformer model.
         graph (dict):
-            The circuit graph containing the nodes to decode. The existing node
-            identifiers and connections are preserved.
+            The circuit graph containing the components to decode.
+            Each component requires a kind and layer, as well as a head
+            index for attention components. If no position is specified,
+            the last clean-prompt token is used.
         clean_prompt (str):
-            The input prompt used to obtain the component activations.
-        activation_cache (dict, optional):
-            Matching clean-prompt activations with the displayed prompt in row 0,
-            BOS retained and padding on the right. The caller is responsible
-            for prompt identity, which plain cache dictionaries do not record.
-            Missing activations can be retrieved through an additional forward
-            pass. Defaults to None.
+            The clean prompt used to obtain component activations.
+        activation_cache (dict or ActivationCache or tuple or list, optional):
+            Previously computed clean-prompt activations, or multiple
+            caches to search. Defaults to None.
         top_k (int, optional):
-            The number of highest-probability vocabulary tokens to return
-            for each component. Defaults to 5.
+            The number of highest-probability tokens to return per vector,
+            limited to the vocabulary size. Defaults to 5.
         allow_forward (bool, optional):
-            Whether to allow an additional model forward pass to retrieve
-            missing activations. If False, only cached activations are used.
-            Defaults to True.
+            Whether to allow an additional forward pass to retrieve
+            missing activations. Defaults to True.
+        _prompt (tuple[torch.Tensor, list[str]], optional):
+            Previously computed token IDs and strings, used to avoid
+            repeated tokenization. Defaults to None.
+        _token_cache (dict[int, str], optional):
+            Previously decoded token strings, reused to avoid repeated
+            conversions. Defaults to None.
 
     Returns:
         dict:
-            The input circuit graph, updated in place with a
-            'component_logit_lens' field for each MLP and attention head node.
-            This field contains the top-k decoded tokens and their probabilities,
-            or indicates that the readout is unavailable.
+            The same graph, updated with a 'component_logit_lens' field
+            for each MLP and attention node. Available readouts contain
+            the selected position, its token, and the top-k tokens with
+            their ranks and probabilities. Unavailable readouts are
+            marked with 'available': False.
     """
 	components = [n for n in graph.get("nodes", []) if n.get("kind") in ("mlp", "attn")]
 	if not components:
@@ -321,24 +480,43 @@ def decode_circuit_components(
 
 
 class LiveComponentLogitLens:
-	"""Job-local activation preparation and on-demand top-k memoization.
+	"""Manage Component Logit Lens readouts during live circuit discovery.
 
-	Retain clean hook_mlp_out and hook_z activations; heads use W_O[head].
-	Prepare before installing search hooks (especially ACDC's patching hooks).
-	Live enrichment never runs a forward pass or resets hooks. Only discovered
-	components are unembedded, once per component/position; repeated events and
-	the completed graph reuse the same isolated-component softmax readouts.
-	The retained top_k is fixed per instance (default 5; the IPE histogram uses 9).
-	"""
+    Prepare and store clean-prompt activations, reusing previously
+    computed readouts as new components are discovered. Missing
+    activations can be retrieved during initialization or final
+    enrichment, avoiding additional forward passes during live updates.
+    """
 
-	def __init__(self, model, clean_prompt: str, activation_cache=None, *, top_k: int = 5):
+	def __init__(
+		self,
+		model: HookedTransformer,
+		clean_prompt: str,
+		activation_cache: dict | ActivationCache | None = None,
+		*,
+		top_k: int = 5,
+	) -> None:
+		"""Prepare and store clean-prompt activations for subsequent
+        component decoding.
+
+        Args:
+            model (HookedTransformer):
+                The transformer model.
+            clean_prompt (str):
+                The clean prompt used to obtain component activations.
+            activation_cache (dict or ActivationCache, optional):
+                Previously computed clean-prompt activations. Defaults to None.
+            top_k (int, optional):
+                The number of highest-probability tokens to return per
+                component, limited to the vocabulary size. Defaults to 5.
+        """
 		self.model = model
 		self.clean_prompt = clean_prompt
 		self.top_k = top_k
-		self.activations = {}
-		self.readouts = {}
-		self.token_cache = {}
-		self._final_retried = set()
+		self.activations: dict[str, torch.Tensor] = {}
+		self.readouts: dict[tuple, dict] = {}
+		self.token_cache: dict[int, str] = {}
+		self._final_retried: set[tuple] = set()
 		self.prompt = None
 		try:
 			self.prompt = _prompt_data(model, clean_prompt)
@@ -347,7 +525,25 @@ class LiveComponentLogitLens:
 			return
 		seq_len = len(self.prompt[1])
 
-		def retain(name, source, layer, kind):
+		def retain(name: str, source: dict | ActivationCache | None, layer: int, kind: str) -> bool:
+			"""Retrieve and validate an activation, storing an independent
+            copy for later use.
+
+            Args:
+                name (str):
+                    The hook name of the activation to retrieve.
+                source (dict or ActivationCache or None):
+                    The cache containing the activation.
+                layer (int):
+                    The index of the component's layer.
+                kind (str):
+                    The component kind, either 'mlp' or 'attn'.
+
+            Returns:
+                bool:
+                    True if the activation is successfully stored,
+                    False if it is missing or invalid.
+            """
 			try:
 				value = _cache_get(source, name)
 				if value is None:
@@ -355,7 +551,8 @@ class LiveComponentLogitLens:
 				node = {"kind": kind, "layer": layer, "head": 0}
 				with torch.no_grad():
 					_component_vector(model, node, {name: value}, seq_len - 1, 0, seq_len=seq_len)
-				self.activations[name] = value[:1, :seq_len].detach().clone()
+				tensor_value = cast(torch.Tensor, value)
+				self.activations[name] = tensor_value[:1, :seq_len].detach().clone()
 				return True
 			except Exception as exc:
 				_diagnostic(f"preparation {name}: {type(exc).__name__}: {exc}")
@@ -385,14 +582,48 @@ class LiveComponentLogitLens:
 			except Exception as exc:
 				_diagnostic(f"preparation capture {sorted(missing)}: {type(exc).__name__}: {exc}")
 
-	def _key(self, node):
+	def _key(self, node: dict) -> tuple:
+		"""Identify a component by its kind, layer, head and position, in order to enable
+        reuse of previously computed readouts.
+
+        Args:
+            node (dict):
+                The component to identify, using its kind, layer, head and token position.
+
+        Returns:
+            tuple:
+                The (kind, layer, head, position) tuple, using the last
+                clean-prompt token if no position is specified and
+                prompt data is available.
+        """
 		position = node.get("position")
 		if position is None and self.prompt is not None:
 			position = len(self.prompt[1]) - 1
 		return (node.get("kind"), node.get("layer"), node.get("head"), position)
 
 	def enrich(self, graph: dict, *, final: bool = False) -> dict:
-		pending = {}
+		"""Update the circuit graph with Component Logit Lens readouts,
+        reusing cached results or decoding new components when needed.
+
+        Args:
+            graph (dict):
+                The circuit graph containing the components to decode.
+            final (bool, optional):
+                Whether to allow an additional forward pass to retrieve
+                missing activations and retry unavailable readouts.
+                Defaults to False.
+
+        Returns:
+            dict:
+                The same graph, updated with a 'component_logit_lens'
+                field for each MLP and attention node.
+
+        Notes:
+            During live updates, only stored activations are used.
+            Final enrichment should run after search and patching hooks
+            have been removed.
+        """
+		pending: dict[tuple, dict] = {}
 		for node in graph.get("nodes", []):
 			if node.get("kind") not in ("mlp", "attn"):
 				continue
