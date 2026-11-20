@@ -77,7 +77,7 @@ def test_decodes_mlp_positions_and_individual_attention_heads():
 
 	decoded = decode_circuit_components(
 		model, graph, "The capital of Italy is",
-		activation_cache={"blocks.0.hook_mlp_out": mlp},
+		activation_cache={"blocks.0.hook_mlp_out": mlp, "blocks.0.attn.hook_z": model.z},
 	)
 	by_id = {node["id"]: node["component_logit_lens"] for node in decoded["nodes"]}
 	assert decoded is graph
@@ -96,18 +96,20 @@ def test_decodes_mlp_positions_and_individual_attention_heads():
 		assert result["available"]
 		assert len(result["top_tokens"]) == 5
 		assert all(0.0 <= item["probability"] <= 1.0 for item in result["top_tokens"])
-	assert model.run_count == 1  # the shared, filtered per-head z pass
+	assert model.run_count == 0
 	assert model.cfg.use_attn_result is False  # the shared model setting is unchanged
 
 
-def test_captures_z_and_reconstructs_a_head():
+def test_initialization_captures_z_and_reconstructs_a_head():
 	model = FakeModel()
 	model.z[0, 4, 0] = torch.tensor([0.0, 1.0, 0.0])
 	graph = {"nodes": [
 		{"id": "attn:0:0:4", "kind": "attn", "layer": 0, "head": 0, "position": 4},
 	], "edges": []}
 
-	decode_circuit_components(model, graph, "The capital of Italy is")
+	lens = LiveComponentLogitLens(model, "The capital of Italy is")
+	assert model.run_count == 1
+	lens.enrich(graph)
 
 	readout = graph["nodes"][0]["component_logit_lens"]
 	assert readout["available"]
@@ -125,7 +127,7 @@ def test_reuses_cached_z_at_the_requested_head_and_position():
 
 	decode_circuit_components(
 		model, graph, "The capital of Italy is",
-		activation_cache={"blocks.0.attn.hook_z": model.z}, allow_forward=False,
+		activation_cache={"blocks.0.attn.hook_z": model.z},
 	)
 
 	readout = graph["nodes"][0]["component_logit_lens"]
@@ -184,7 +186,7 @@ def test_live_events_and_final_graph_reuse_readouts(monkeypatch):
 	assert all(n["component_logit_lens"]["available"] for n in nodes)
 	repeated = {"nodes": [dict(n) for n in nodes]}
 	lens.enrich(repeated)
-	lens.enrich(repeated, final=True)
+	lens.enrich(repeated)
 	assert decoded_batches == [2]
 	assert repeated["nodes"][0]["component_logit_lens"] is nodes[0]["component_logit_lens"]
 
@@ -207,7 +209,7 @@ def test_live_top_nine_reuses_the_existing_decoder_and_full_vocabulary_probabili
 	assert sum(t["probability"] for t in readout["top_tokens"]) < 1
 	assert readout["position"] == 4 and readout["position_token"] == PROMPT_TOKENS[4]
 	repeated = {"nodes": [dict(node, id="another-occurrence")]}
-	lens.enrich(repeated, final=True)
+	lens.enrich(repeated)
 	assert repeated["nodes"][0]["component_logit_lens"] is readout
 	assert model.run_count == 0
 
@@ -230,33 +232,162 @@ def test_live_acdc_snapshots_use_last_position_and_are_job_local():
 	assert model.run_count == 0
 
 
-def test_missing_live_activations_do_not_forward_and_final_can_retry(monkeypatch):
+@pytest.mark.parametrize("cache_kind", ["complete", "partial", "none", "empty", "invalid"])
+def test_initialization_reuses_valid_activations_and_captures_missing_once(monkeypatch, cache_kind):
+	model = FakeModel()
+	full = {
+		"blocks.0.hook_mlp_out": torch.ones(2, len(PROMPT_TOKENS) + 2, 3, requires_grad=True),
+		"blocks.0.attn.hook_z": model.z,
+	}
+	supplied = {
+		"complete": full,
+		"partial": {"blocks.0.hook_mlp_out": full["blocks.0.hook_mlp_out"]},
+		"none": None,
+		"empty": {},
+		"invalid": full | {"blocks.0.attn.hook_z": torch.zeros(1, 2, 2, 3)},
+	}[cache_kind]
+	capture = Mock(side_effect=lambda tokens, names_filter: (
+		None, {name: value for name, value in full.items() if names_filter(name)}
+	))
+	monkeypatch.setattr(model, "run_with_cache", capture)
+
+	lens = LiveComponentLogitLens(model, "clean prompt", supplied)
+
+	assert capture.call_count == (0 if cache_kind == "complete" else 1)
+	assert set(lens.activations) == set(full)
+	for name, value in full.items():
+		retained = lens.activations[name]
+		torch.testing.assert_close(retained, value[:1, :len(PROMPT_TOKENS)])
+		assert retained.data_ptr() != value.data_ptr()
+		assert not retained.requires_grad
+	if capture.called:
+		captured_names = {name for name in full if capture.call_args.kwargs["names_filter"](name)}
+		expected = set(full) if cache_kind in ("none", "empty") else {"blocks.0.attn.hook_z"}
+		assert captured_names == expected
+
+
+def test_failed_preparation_is_not_retried_during_enrichment(monkeypatch):
+	model = FakeModel()
+	capture = Mock(side_effect=RuntimeError("capture failed"))
+	monkeypatch.setattr(model, "run_with_cache", capture)
+	lens = LiveComponentLogitLens(model, "clean prompt")
+	assert capture.call_count == 1
+	assert lens.activations == {}
+
+	graph = {"nodes": [{"kind": "attn", "layer": 0, "head": 0, "position": 4}]}
+	lens.enrich(graph)
+	lens.enrich(graph)
+	assert capture.call_count == 1
+	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
+
+
+def test_completed_acdc_graph_decodes_unseen_components_without_forwarding(monkeypatch):
+	model = FakeModel()
+	cache = {
+		"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": model.z,
+	}
+	capture = Mock(return_value=(None, cache))
+	monkeypatch.setattr(model, "run_with_cache", capture)
+	lens = LiveComponentLogitLens(model, "clean prompt")  # ACDC supplies no cache.
+	assert capture.call_count == 1
+	unembed = Mock(wraps=model.unembed)
+	monkeypatch.setattr(model, "unembed", unembed)
+
+	node = {"kind": "attn", "layer": 0, "head": 0, "position": None}
+	lens.enrich({"nodes": [node]})
+	readout = node["component_logit_lens"]
+	completed = {"nodes": [
+		dict(node, id="another-occurrence"),
+		{"kind": "attn", "layer": 0, "head": 1, "position": None},
+		{"kind": "mlp", "layer": 0, "position": None},
+	]}
+	lens.enrich(completed)
+	lens.enrich(completed)
+
+	assert capture.call_count == 1
+	assert unembed.call_count == 2
+	assert unembed.call_args.args[0].shape[0] == 2  # Only the newly seen components.
+	assert completed["nodes"][0]["component_logit_lens"] is readout
+	assert all(n["component_logit_lens"]["available"] for n in completed["nodes"])
+	assert all(n["component_logit_lens"]["position"] == len(PROMPT_TOKENS) - 1 for n in completed["nodes"])
+
+
+def test_missing_prepared_activations_are_cached_without_recovery(monkeypatch):
 	model = FakeModel()
 	lens = LiveComponentLogitLens(model, "The capital of Italy is")
 	lens.activations.clear()  # Simulate failed preparation.
+	capture = Mock(side_effect=AssertionError("Enrichment must never forward"))
+	monkeypatch.setattr(model, "run_with_cache", capture)
+	decode = Mock(wraps=decode_circuit_components)
+	monkeypatch.setattr("ipe.webutils.component_logit_lens.decode_circuit_components", decode)
 	graph = {"nodes": [
 		{"id": "attn:0:1:4", "kind": "attn", "layer": 0, "head": 1, "position": 4},
 	]}
 	passes = model.run_count
 	lens.enrich(graph)
+	readout = graph["nodes"][0]["component_logit_lens"]
+	# Even if activations appear later, this job's failed readout stays cached.
+	lens.activations["blocks.0.attn.hook_z"] = model.z
 	lens.enrich(graph)
+	completed = {"nodes": [dict(graph["nodes"][0], id="another-occurrence")]}
+	lens.enrich(completed)
+	capture.assert_not_called()
+	assert decode.call_count == 1
+	assert decode.call_args.args[3] is lens.activations
 	assert model.run_count == passes
-	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
-	lens.enrich(graph, final=True)
-	assert graph["nodes"][0]["component_logit_lens"]["available"]
-	assert model.run_count == passes + 1
+	assert readout == {"available": False}
+	assert completed["nodes"][0]["component_logit_lens"] is readout
 
 
-@pytest.mark.parametrize("shape", [(1, 6, 3), (1, 6, 1, 3), (1, 2, 2, 3), (0, 6, 2, 3), (1, 6, 2, 7)])
-def test_invalid_z_is_replaced_by_valid_z_from_capture(shape):
+@pytest.mark.parametrize("activation", [
+	torch.zeros(1, 6, 3), torch.zeros(1, 6, 1, 3), torch.zeros(1, 2, 2, 3),
+	torch.zeros(0, 6, 2, 3), torch.zeros(1, 6, 2, 7),
+	None, "not a tensor", torch.zeros(1, 5, 2, 3),
+])
+def test_initialization_recovers_unusable_z_once(activation):
 	model = FakeModel()
+	lens = LiveComponentLogitLens(model, "The capital of Italy is", {
+		"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": activation,
+	})
+	assert model.run_count == 1
+	torch.testing.assert_close(lens.activations["blocks.0.attn.hook_z"], model.z)
 	graph = {"nodes": [{"id": "attn:0:1:4", "kind": "attn", "layer": 0, "head": 1, "position": 4}]}
-	decode_circuit_components(
-		model, graph, "The capital of Italy is",
-		activation_cache={"blocks.0.attn.hook_z": torch.zeros(shape)},
-	)
+	lens.enrich(graph)
 	assert graph["nodes"][0]["component_logit_lens"]["top_tokens"][0]["token"] == "token-9"
 	assert model.run_count == 1
+
+
+def test_decoder_extraction_errors_do_not_block_other_components(monkeypatch):
+	model = FakeModel()
+	extract = Mock(side_effect=[RuntimeError("unusable activation"), model.z[0, 4, 0]])
+	monkeypatch.setattr("ipe.webutils.component_logit_lens._component_vector", extract)
+	graph = {"nodes": [
+		{"id": "failed", "kind": "attn", "layer": 0, "head": 0, "position": 4},
+		{"id": "valid", "kind": "attn", "layer": 0, "head": 0, "position": 4},
+	]}
+
+	decode_circuit_components(model, graph, "clean prompt", {"blocks.0.attn.hook_z": model.z})
+
+	assert extract.call_count == 2
+	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
+	assert graph["nodes"][1]["component_logit_lens"]["top_tokens"][0]["token"] == "token-0"
+	assert model.run_count == 0
+
+
+def test_standalone_accepts_clean_cache_prefix_covering_requested_position():
+	model = FakeModel()
+	cache = {"blocks.0.attn.hook_z": model.z[:, :5]}
+	node = {"kind": "attn", "layer": 0, "head": 1, "position": 4}
+
+	decode_circuit_components(model, {"nodes": [node]}, "The capital of Italy is", cache)
+
+	readout = node["component_logit_lens"]
+	assert readout["available"]
+	assert readout["position_token"] == PROMPT_TOKENS[4]
+	assert readout["top_tokens"][0]["token"] == "token-9"
+	assert model.run_count == 0
 
 
 def test_projects_with_the_correct_head_weights_dtype_and_residual_width():
@@ -282,7 +413,7 @@ def test_rejects_invalid_layer_and_head(field, value):
 	with pytest.raises(IndexError):
 		_component_vector(model, node, {"blocks.0.attn.hook_z": model.z}, 4, 0, seq_len=6)
 	graph = {"nodes": [dict(node, position=4)]}
-	decode_circuit_components(model, graph, "prompt")
+	decode_circuit_components(model, graph, "prompt", {})
 	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
 	assert model.run_count == 0
 
@@ -296,23 +427,61 @@ def test_rejects_invalid_token_and_batch_indices(position, batch):
 
 
 @pytest.mark.parametrize("shape", [(6, 3), (2, 3, 4), (1, 3, 3), (2, 4, 3), None])
-def test_incompatible_projection_is_unavailable_without_capture(shape, caplog):
+def test_initialization_skips_incompatible_projection_without_capture(shape, caplog):
+	_diagnostic.cache_clear()
 	model = FakeModel()
 	model.blocks[0].attn.W_O = None if shape is None else torch.zeros(shape)
-	graph = {"nodes": [{"id": "bad-projection", "kind": "attn", "layer": 0, "head": 0, "position": 4}]}
-	decode_circuit_components(model, graph, "prompt", {"blocks.0.attn.hook_z": model.z})
+	lens = LiveComponentLogitLens(model, "prompt", {
+		"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": model.z,
+	})
+	assert set(lens.activations) == {"blocks.0.hook_mlp_out"}
+	graph = {"nodes": [
+		{"id": "bad-projection", "kind": "attn", "layer": 0, "head": 0, "position": 4},
+		{"kind": "mlp", "layer": 0, "position": 4},
+	]}
+	lens.enrich(graph)
 	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
-	assert "blocks.0.attn.W_O must have shape" in caplog.text
+	assert graph["nodes"][1]["component_logit_lens"]["available"]
+	assert "blocks.0.attn.W_O" in caplog.text
+	assert str((model.cfg.n_heads, model.cfg.d_head, model.cfg.d_model)) in caplog.text
 	assert model.run_count == 0
 
 
-@pytest.mark.parametrize("activation", [None, "not a tensor", torch.zeros(1, 5, 2, 3)])
-def test_missing_or_invalid_z_never_uses_result_as_a_substitute(activation):
+def test_decoder_requires_activation_cache():
+	with pytest.raises(TypeError, match="activation_cache"):
+		decode_circuit_components(FakeModel(), {"nodes": []}, "prompt")
+
+
+@pytest.mark.parametrize("cache_kind", ["empty", "result_only", "mlp_only", "attn_only", "complete"])
+def test_decoder_uses_available_entries_without_forwarding(monkeypatch, cache_kind):
 	model = FakeModel()
-	cache = {"blocks.0.attn.hook_z": activation, "blocks.0.attn.hook_result": torch.ones(1, 6, 2, 3)}
-	graph = {"nodes": [{"kind": "attn", "layer": 0, "head": 0, "position": 4}]}
-	decode_circuit_components(model, graph, "prompt", cache, allow_forward=False)
-	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
+	full = {
+		"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": model.z,
+	}
+	cache = {
+		"empty": {},
+		"result_only": {"blocks.0.attn.hook_result": torch.ones(1, 6, 2, 3)},
+		"mlp_only": {"blocks.0.hook_mlp_out": full["blocks.0.hook_mlp_out"]},
+		"attn_only": {"blocks.0.attn.hook_z": model.z},
+		"complete": full,
+	}[cache_kind]
+	forbidden = Mock(side_effect=AssertionError("Decoding must not execute or reset the model"))
+	monkeypatch.setattr(model, "run_with_cache", forbidden)
+	monkeypatch.setattr(model, "reset_hooks", forbidden)
+	graph = {"nodes": [
+		{"kind": "mlp", "layer": 0, "position": 4},
+		{"kind": "attn", "layer": 0, "head": 0, "position": 4},
+	]}
+	decode_circuit_components(model, graph, "prompt", cache)
+	for node, name in zip(graph["nodes"], full):
+		readout = node["component_logit_lens"]
+		if name in cache:
+			assert readout["available"]
+		else:
+			assert readout == {"available": False}
+	forbidden.assert_not_called()
 	assert model.run_count == 0
 
 
@@ -349,44 +518,56 @@ def test_live_reuses_tokenization_strings_and_owns_only_clean_row(monkeypatch):
 	assert model.run_count == 0
 
 
-def test_diagnostics_distinguish_missing_shape_and_unexpected_errors(caplog):
+def test_diagnostics_identify_missing_activations_and_unexpected_errors(caplog):
 	_diagnostic.cache_clear()
 	model = FakeModel()
 	node = {"id": "diagnostic-head", "kind": "attn", "layer": 0, "head": 1, "position": 4}
 	graph = {"nodes": [node]}
-	decode_circuit_components(model, graph, "prompt", allow_forward=False)
-	assert "Missing activations" in caplog.text
+	decode_circuit_components(model, graph, "prompt", {})
+	assert "diagnostic-head" in caplog.text
+	assert "activation" in caplog.text.lower()
+	assert "KeyError" in caplog.text
 	assert "blocks.0.attn.hook_z" in caplog.text
-	cache = {"blocks.0.attn.hook_z": torch.zeros(1, 6, 1, 3)}
-	decode_circuit_components(model, graph, "prompt", cache, allow_forward=False)
-	assert "Incompatible activation shape" in caplog.text
+	assert node["component_logit_lens"] == {"available": False}
+	caplog.clear()
 	class BrokenCache:
 		def __getitem__(self, name):
 			raise RuntimeError("broken cache backend")
-	decode_circuit_components(model, graph, "prompt", BrokenCache(), allow_forward=False)
-	assert "RuntimeError: broken cache backend" in caplog.text
+	decode_circuit_components(model, graph, "prompt", BrokenCache())
+	assert "RuntimeError" in caplog.text
+	assert "broken cache backend" in caplog.text
 	assert "diagnostic-head" in caplog.text
 	count = len(caplog.records)
-	decode_circuit_components(model, graph, "prompt", BrokenCache(), allow_forward=False)
+	decode_circuit_components(model, graph, "prompt", BrokenCache())
 	assert len(caplog.records) == count
 	assert node["component_logit_lens"] == {"available": False}
 
 
-def test_failed_final_retry_is_memoized(monkeypatch):
+def test_failed_readouts_are_cached_without_retry(monkeypatch):
 	model = FakeModel()
-	lens = LiveComponentLogitLens(model, "prompt")
-	lens.activations.clear()
-	def broken_forward(*args, **kwargs):
-		model.run_count += 1
-		raise RuntimeError("capture failed")
-	monkeypatch.setattr(model, "run_with_cache", broken_forward)
+	cache = {"blocks.0.hook_mlp_out": torch.ones(1, len(PROMPT_TOKENS), 3),
+		"blocks.0.attn.hook_z": model.z}
+	lens = LiveComponentLogitLens(model, "prompt", cache)
+	capture = Mock(side_effect=AssertionError("Enrichment must never forward"))
+	monkeypatch.setattr(model, "run_with_cache", capture)
+	original_unembed = model.unembed
+	broken_unembed = Mock(side_effect=RuntimeError("unembedding failed"))
+	monkeypatch.setattr(model, "unembed", broken_unembed)
 	graph = {"nodes": [{"kind": "attn", "layer": 0, "head": 0, "position": 4}]}
 	lens.enrich(graph)
-	before = model.run_count
-	lens.enrich(graph, final=True)
-	lens.enrich(graph, final=True)
-	assert model.run_count == before + 1
-	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
+	readout = graph["nodes"][0]["component_logit_lens"]
+	broken_unembed.assert_called_once()
+
+	healthy_unembed = Mock(wraps=original_unembed)
+	monkeypatch.setattr(model, "unembed", healthy_unembed)
+	lens.enrich(graph)
+	completed = {"nodes": [dict(graph["nodes"][0], id="another-occurrence")]}
+	lens.enrich(completed)
+	capture.assert_not_called()
+	healthy_unembed.assert_not_called()
+	assert model.run_count == 0
+	assert readout == {"available": False}
+	assert completed["nodes"][0]["component_logit_lens"] is readout
 
 
 def test_missing_z_hook_is_unavailable_without_changing_config(caplog):
@@ -403,6 +584,7 @@ def test_missing_z_hook_is_unavailable_without_changing_config(caplog):
 
 
 def test_decoding_failure_logs_component_and_keeps_graph_usable(monkeypatch, caplog):
+	_diagnostic.cache_clear()
 	model = FakeModel()
 	def broken_unembed(vectors):
 		raise RuntimeError("unembedding failed")
@@ -412,7 +594,11 @@ def test_decoding_failure_logs_component_and_keeps_graph_usable(monkeypatch, cap
 	assert decode_circuit_components(model, graph, "prompt", {"blocks.0.attn.hook_z": model.z}) is graph
 	assert node["component_logit_lens"] == {"available": False}
 	assert graph["edges"] == [{"source": "a", "target": "b"}]
-	assert "failed-readout: ln_final/unembed readout: RuntimeError: unembedding failed" in caplog.text
+	assert len(caplog.records) == 1
+	assert "failed-readout" in caplog.text
+	assert "decod" in caplog.text.lower()
+	assert "RuntimeError" in caplog.text
+	assert "unembedding failed" in caplog.text
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
@@ -450,7 +636,7 @@ def test_nonfinite_readouts_are_unavailable_without_affecting_valid_rows(monkeyp
 
 
 @pytest.mark.parametrize("kv_heads", [None, 1])
-def test_transformer_lens_projection_and_scoped_hook_safety(kv_heads):
+def test_transformer_lens_projection_and_scoped_hook_safety(monkeypatch, kv_heads):
 	transformer_lens = pytest.importorskip("transformer_lens")
 	model = transformer_lens.HookedTransformer(transformer_lens.HookedTransformerConfig(
 		n_layers=1, n_heads=2, n_key_value_heads=kv_heads, d_model=10, d_head=4,
@@ -470,15 +656,19 @@ def test_transformer_lens_projection_and_scoped_hook_safety(kv_heads):
 		node = {"kind": "attn", "layer": 0, "head": head}
 		actual = _component_vector(model, node, cache, 2, 0, seq_len=3)
 		torch.testing.assert_close(actual, expected[0, 2, head])
-	# Let the real run_with_cache install/remove its own hooks inside an outer
-	# search-like context. decode must preserve both this hook and its context.
+	# Decode the prepared cache inside an outer search-like hook context.
+	# Neither a direct forward nor run_with_cache may execute during decoding.
+	forbidden = Mock(side_effect=AssertionError("Decoding must not forward"))
+	monkeypatch.setattr(model, "forward", forbidden)
+	monkeypatch.setattr(model, "run_with_cache", forbidden)
 	calls = []
 	hook = model.hook_dict["blocks.0.attn.hook_z"]
 	with model.hooks(fwd_hooks=[("blocks.0.attn.hook_z", lambda value, hook: calls.append(value.shape))]):
 		hook.ctx["search-owned"] = True
 		graph = {"nodes": [{"kind": "attn", "layer": 0, "head": 1, "position": 2}]}
-		decode_circuit_components(model, graph, "unused", _prompt=(tokens, ["BOS", "one", "two"]))
-		assert calls == [torch.Size([1, 3, 2, 4])]
+		decode_circuit_components(model, graph, "unused", cache, _prompt=(tokens, ["BOS", "one", "two"]))
+		forbidden.assert_not_called()
+		assert calls == []
 		assert len(hook.fwd_hooks) == 1
 		assert hook.ctx["search-owned"] is True
 		assert graph["nodes"][0]["component_logit_lens"]["available"]
@@ -512,7 +702,7 @@ def test_decoder_uses_first_clean_row_last_position_and_normalized_softmax(metho
 		dict(id="mlp:0:1", kind="mlp", layer=0, position=1), dict(id="embed:*", kind="embed"),
 	]
 	graph = {"nodes": nodes, "edges": [], "method": method}
-	assert decode_circuit_components(model, graph, "first clean prompt", cache, allow_forward=False) is graph
+	assert decode_circuit_components(model, graph, "first clean prompt", cache) is graph
 	expected, ids = torch.softmax((cache["blocks.0.hook_mlp_out"][0, 2] / 2 @ weights).float(), -1).topk(5)
 	lens = nodes[0]["component_logit_lens"]
 	assert lens == nodes[1]["component_logit_lens"]  # no shared attention bias; KV position is not readout position
@@ -552,7 +742,7 @@ def test_inspector_readouts_use_query_not_kv_and_keep_full_vocabulary_softmax(po
 	node = dict(id="head", kind="attn", layer=0, head=0, position=position,
 		kv_position=kv_position, variant="KV")
 	graph = {"nodes": [node], "edges": []}
-	lens.enrich(graph, final=True)
+	lens.enrich(graph)
 	readout = node["component_logit_lens"]
 	query = 2 if position is None else position
 	probabilities = torch.softmax((cache["blocks.0.attn.hook_z"][0, query, 0] / 2 @ weights).float(), -1)
@@ -574,7 +764,7 @@ def test_nonfinite_last_token_readout_is_unavailable():
 	model, cache, _ = _make_readout_contract()
 	cache["blocks.0.hook_mlp_out"][0, 2, 0] = float("nan")
 	graph = {"nodes": [dict(id="mlp:0:*", kind="mlp", layer=0, position=None)]}
-	decode_circuit_components(model, graph, "prompt", cache, allow_forward=False)
+	decode_circuit_components(model, graph, "prompt", cache)
 	assert graph["nodes"][0]["component_logit_lens"] == {"available": False}
 
 

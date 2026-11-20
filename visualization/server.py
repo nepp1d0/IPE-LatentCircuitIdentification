@@ -314,7 +314,7 @@ def _run_acdc(job: Job, req: SearchRequest) -> None:
 		)
 		job.push({"event": "status", "status": "running",
 				  "message": "Decoding discovered components from the clean prompt..."})
-		lens.enrich(graph, final=True)
+		lens.enrich(graph)
 		del lens
 
 		job.result = _scrub({
@@ -466,7 +466,7 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 			runtime = time.time() - t0
 			job.push({"event": "status", "status": "running",
 					  "message": "Decoding discovered components from the clean prompt..."})
-			lens.enrich(graph, final=True)
+			lens.enrich(graph)
 			del lens
 
 			job.result = _scrub({
