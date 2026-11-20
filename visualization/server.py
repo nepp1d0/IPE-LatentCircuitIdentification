@@ -53,6 +53,7 @@ from ipe.graph_search import (
 )
 from ipe.webutils.serialization import graph_from_paths, graph_from_tree, node_to_dict
 from ipe.webutils.component_logit_lens import LiveComponentLogitLens
+from ipe.webutils.path_probabilities import PathProbabilityCollector, DEFAULT_TOP_K
 from ipe.webutils import acdc_bridge
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -191,6 +192,7 @@ class SearchRequest(BaseModel):
 	metric: str = "logit_difference"
 	positional: bool = True
 	include_negative: bool = True
+	probability_top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=20)
 	# ACDC only (method == "acdc"); the knobs above do not apply to it.
 	acdc_metric: str = "kl_div"
 	acdc_threshold: float = 0.0575
@@ -334,6 +336,8 @@ def _run_acdc(job: Job, req: SearchRequest) -> None:
 				"acdc_edges": info["acdc_edges"],
 				"acdc_initial_edges": info["initial_acdc_edges"],
 				"final_metric": info["final_metric"],
+				"probability_context": {"available": False, "method": "acdc",
+					"reason": "ACDC's collapsed edge graph does not retain isolated path interventions."},
 			},
 		})
 		job.status = "complete"
@@ -415,12 +419,20 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 				algorithm_params={"min_contribution": req.min_contribution,
 								  "include_negative": req.include_negative},
 				metric=req.metric,
+				metric_params={},
 				positional_search=req.positional,
 				patch_type="counterfactual" if has_cf else "zero",
 				patch_clean_into_cf=denoising,
 			)
 			metric = experiment.metric
 			root = experiment.root
+			probabilities = PathProbabilityCollector(
+				model, root, context_id=job.id, method=req.method, mode=req.mode,
+				reference_prompt=(req.cf_prompts if denoising else req.prompts)[0],
+				target=req.targets[0] if req.targets else None,
+				counterfactual=req.cf_targets[0] if req.cf_targets else None,
+				top_k=req.probability_top_k,
+			)
 			job.push({"event": "status", "status": "running", "message": "Preparing live component readouts..."})
 			lens = LiveComponentLogitLens(model, req.prompts[0], experiment.cache, top_k=9)
 			if job.cancel_requested:
@@ -438,7 +450,8 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 				kwargs = ({"min_contribution": req.min_contribution} if req.strategy == "threshold"
 						  else {"max_width": req.max_width})
 				out_root = search(model, metric, root, include_negative=req.include_negative,
-								  joint_scoring=False, on_event=on_event, **kwargs)
+							  joint_scoring=False, on_event=on_event,
+							  on_path_evaluated=probabilities.observe, **kwargs)
 				graph = graph_from_tree(out_root, joint_scoring=False)
 				joint = float(evaluate_tree(out_root, metric))
 			else:
@@ -447,7 +460,7 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 				kwargs = ({"min_contribution": req.min_contribution} if req.strategy == "threshold"
 						  else {"max_width": req.max_width})
 				paths = search(model, metric, root, include_negative=req.include_negative,
-							   on_event=on_event, **kwargs)
+							   on_event=on_event, on_path_evaluated=probabilities.observe, **kwargs)
 				graph = graph_from_paths(paths)
 				joint = None
 			runtime = time.time() - t0
@@ -471,6 +484,7 @@ def _run_search(job: Job, req: SearchRequest) -> None:
 					"joint_tree_contribution": joint,
 					"n_nodes": len(graph["nodes"]),
 					"n_edges": len(graph["edges"]),
+					"probability_context": probabilities.context,
 				},
 			})
 			job.status = "complete"

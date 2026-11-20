@@ -12,6 +12,7 @@ test/
 ├── test_experiment.py
 ├── test_joint_scoring.py
 ├── test_nodes.py
+├── test_path_probabilities.py
 ├── test_path_provenance.py
 └── visualization/
     ├── component_decoding.test.cjs
@@ -21,6 +22,7 @@ test/
     ├── path_inspector.test.cjs
     ├── path_inspector_layout.test.cjs
     ├── path_presentation.test.cjs
+    ├── path_probabilities.test.cjs
     └── path_fixtures.cjs
 ```
 
@@ -35,6 +37,7 @@ test/
 | `path_inspector.test.cjs` | Path Inspector integration: navigation, selection, comparisons, scores, filtering, state management, component decoding, and information popovers. |
 | `path_inspector_layout.test.cjs` | Browser-based layout validation: responsive sizing, scrolling, navigation, histogram readability, probability labels, and popover behavior. |
 | `path_presentation.test.cjs` | Score and probability formatting, metric descriptions, tooltips, and path difference labels. |
+| `path_probabilities.test.cjs` | Final path probability validation, token roles and GPT-2 leading-space fallback, shared axis scaling, numerical formatting, and responsive chart rendering. |
 | `path_fixtures.cjs` | Shared graph and occurrence factories for tests (not a test file). |
 
 ### Python tests
@@ -45,6 +48,7 @@ test/
 | `test_experiment.py` | Experiment validation, setup, saving, and algorithm × strategy × metric execution. Loads GPT-2. |
 | `test_joint_scoring.py` | Cached tree messages, incremental evaluation, isolated/joint scoring, and simultaneous admission. Loads GPT-2. |
 | `test_nodes.py` | Node messages, patching, expansion candidates, and gradients. Loads GPT-2 and Qwen. |
+| `test_path_probabilities.py` | Final-output probabilities, Top-5 probability changes, scored residual reuse, search integration, patching modes, unavailable states, and serialization. |
 | `test_path_provenance.py` | Original path identities, Q/K/V occurrences, tree merging, scoring modes, search results, and serialization, including Top-9 configuration. |
 
 The `benchmark/Automatic-Circuit-Discovery` submodule contains its own upstream tests, which are not included in this suite.

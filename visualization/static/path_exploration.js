@@ -33,6 +33,8 @@ const PathExploration = (() => {
 			}
 			if ([...edgeKeys].some((key) => !edges.has(key)) || index.paths.has(original.id)) continue;
 			const path = { id: original.id, ordinal: index.paths.size + 1, nodeIds, edgeKeys,
+				probabilityComparison: original.probability_comparison,
+				occurrenceIds: [...(original.occurrence_ids || [])],
 				sequence: [...ids], score: Number.isFinite(original.score) ? original.score : null,
 				scoreKind: original.score_kind || "unknown",
 				// Keep the original ordered sequence (including occurrence variants)

@@ -171,6 +171,11 @@ class _PathProvenance:
 		"""Store an original path and its node occurrences, preserving
         their original identities.
 
+        Occurrence IDs identify original Node objects, while node IDs identify
+        merged grid components. For complete paths, a stored probability
+        comparison is copied only if its ordered grid IDs match this path,
+        and is linked to the path and occurrence IDs without recomputation.
+
         Args:
             path (list[Node]):
                 The path nodes ordered from embedding to root.
@@ -205,6 +210,11 @@ class _PathProvenance:
 			"score": value,
 			"score_kind": score_kind if complete else None,
 		})
+		comparison = getattr(path[0], "path_probability_comparison", None) if complete else None
+		if comparison is not None and comparison.get("node_ids") == self.paths[-1]["node_ids"]:
+			self.paths[-1]["probability_comparison"] = {
+				**comparison, "path_id": self.paths[-1]["id"], "occurrence_ids": occurrence_ids,
+			}
 
 	def to_dict(self) -> dict:
 		"""Convert the stored path provenance into a dictionary.

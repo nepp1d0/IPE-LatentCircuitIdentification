@@ -21,3 +21,4 @@ API reference for the project's codebase.
    Paths <paths>
    Serialization <webutils/serialization>
    Component Logit Lens <webutils/component_logit_lens>
+   Path Probabilities <webutils/path_probabilities>

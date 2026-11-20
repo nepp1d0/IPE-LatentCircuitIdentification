@@ -148,12 +148,15 @@
 			title="Drag to resize. Left arrow widens; right arrow narrows. Double-click to reset."></div>
 		<header class="path-inspector-header">
 			<div class="path-heading-row">
-				<h2 id="path-heading">Paths through node</h2>
+				<div class="path-heading-text">
+					<h2 id="path-heading">Paths through node</h2>
+					<div id="path-node"></div>
+				</div>
 				<div class="path-header-actions">
 					<button id="path-clear" type="button">Clear</button>
-					<div id="path-info-wrap">
-						<button id="path-info" type="button" aria-label="About path exploration" aria-expanded="false" aria-controls="path-info-popover" aria-describedby="path-info-popover">i</button>
-						<div id="path-info-popover" role="note" hidden>
+					<div id="path-info-wrap" class="path-info-wrap">
+						<button id="path-info" class="path-info-button" type="button" aria-label="About path exploration" aria-expanded="false" aria-controls="path-info-popover" aria-describedby="path-info-popover">i</button>
+						<div id="path-info-popover" class="path-info-popover" role="note" hidden>
 							<strong>Exploring paths</strong>
 							<ul>
 								<li>Click a circuit component to explore the complete discovered paths passing through it.</li>
@@ -166,13 +169,8 @@
 					</div>
 				</div>
 			</div>
-			<div id="path-node"></div>
-			<div id="path-count" role="status" aria-live="polite"></div>
-			<div id="path-legend-row">
-				<div id="path-key" class="path-exploration-legend" aria-label="Path highlighting">
-					<span><span class="path-line-sample selected" aria-hidden="true"></span>Selected</span>
-					<span><span class="path-line-sample alternative" aria-hidden="true"></span>Alternatives</span>
-				</div>
+			<div class="path-count-row">
+				<div id="path-count" role="status" aria-live="polite"></div>
 				<div id="path-sort-wrap">
 					<button id="path-sort-toggle" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="path-sort">
 						<span aria-hidden="true">⇅</span> Sort <span id="path-sort-current">Discovery</span>
@@ -197,9 +195,16 @@
 					</div>
 				</div>
 			</div>
-			<p id="path-help" class="hint" hidden></p>
+			<div id="path-legend-row" aria-label="Path and probability chart legend">
+				<div id="path-key" class="path-exploration-legend" role="group" aria-label="Path highlighting">
+					<span><span class="path-line-sample selected" aria-hidden="true"></span>Selected</span>
+					<span><span class="path-line-sample alternative" aria-hidden="true"></span>Alternatives</span>
+				</div>
+				<section id="path-probability-guide" aria-label="Final prediction probability chart legend" hidden></section>
+			</div>
 		</header>
-		<p id="path-score-context" hidden></p>
+		<p id="path-help" class="hint" hidden></p>
+		<p id="path-score-context" class="visually-hidden" hidden></p>
 		<div id="path-list" role="group" aria-label="Original discovered paths" aria-describedby="path-score-context"></div>
 		<section id="selected-path-details" hidden aria-labelledby="selected-path-heading">
 			<div class="path-component-layout">
@@ -211,9 +216,9 @@
 				<section id="component-decoding" class="path-component-section" aria-labelledby="component-decoding-heading">
 					<div class="component-decoding-header">
 						<h3 id="component-decoding-heading">Component Decoding</h3>
-						<div id="component-decoding-info-wrap">
-							<button id="component-decoding-info" type="button" aria-label="About Component Decoding" aria-expanded="false" aria-controls="component-decoding-info-popover" aria-describedby="component-decoding-info-popover">ⓘ</button>
-							<div id="component-decoding-info-popover" role="note" hidden>
+						<div id="component-decoding-info-wrap" class="path-info-wrap">
+							<button id="component-decoding-info" class="path-info-button" type="button" aria-label="About Component Decoding" aria-expanded="false" aria-controls="component-decoding-info-popover" aria-describedby="component-decoding-info-popover">i</button>
+							<div id="component-decoding-info-popover" class="path-info-popover" role="note" hidden>
 								<strong>About Component Decoding</strong>
 								<p>The chart shows the top tokens obtained by projecting the selected component's output into the vocabulary space using a logit lens.</p>
 								<p>For attention heads, the full output at the query position is decoded, rather than the isolated message of the selected path.</p>
@@ -231,6 +236,7 @@
 <script src="/static/path_presentation.js"></script>
 <script src="/static/path_diagram.js"></script>
 <script src="/static/component_decoding.js"></script>
+<script src="/static/path_probabilities.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

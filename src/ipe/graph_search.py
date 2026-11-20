@@ -289,8 +289,8 @@ def _joint_scoring_context(root: Node, frontier: list[Node], metric: Callable) -
 	return messages, baselines
 
 
-def _score_candidate(candidate: Node, leaf: Node, suffix: list[Node], root: Node, metric: Callable, joint: tuple = None) -> torch.Tensor:
-	"""Contribution of attaching `candidate` under `leaf`, isolated or joint.
+def _score_candidate(candidate: Node, leaf: Node, suffix: list[Node], root: Node, metric: Callable, joint: tuple = None, on_path_evaluated: Callable[[list[Node], torch.Tensor], None] | None = None) -> torch.Tensor:
+	"""Score a candidate extension in isolation or in the current tree.
 
 	Isolated (`joint is None`): the branch's own contribution, `evaluate_path([candidate, leaf, ..., root])`,
 	which depends only on the chain and so is independent of everything else in the tree.
@@ -311,12 +311,17 @@ def _score_candidate(candidate: Node, leaf: Node, suffix: list[Node], root: Node
 			A function to evaluate the contribution of the path or tree. It must accept a single parameter: `corrupted_resid`.
 		joint (tuple, optional):
 			`(messages, baselines)` from :func:`_joint_scoring_context`. If None, scores in isolation.
+		on_path_evaluated (Callable, optional):
+			Observer called with (path, patched residual) after isolated
+			path scoring, before admission. Defaults to None.
 
 	Returns:
 		torch.Tensor:
 			The contribution of the candidate.
 	"""
 	if joint is None:
+		if on_path_evaluated is not None:
+			return evaluate_path([candidate] + suffix, metric, on_evaluated=on_path_evaluated)
 		return evaluate_path([candidate] + suffix, metric)
 	messages, baselines = joint
 	branch = leaf.forward(message=candidate.forward(message=None))
@@ -330,7 +335,8 @@ def TreeMessagePatching(
 	min_contribution: float = 0.5,
 	include_negative: bool = True,
 	joint_scoring: bool = False,
-	on_event: Callable = None,
+	on_event: Callable[[dict], None] | None = None,
+	on_path_evaluated: Callable[[list[Node], torch.Tensor], None] | None = None,
 ) -> Node:
 	"""
 	Performs a Breadth-First Search (BFS) backwards from a node, growing a single
@@ -374,6 +380,9 @@ def TreeMessagePatching(
 			Observer called with progress events (dicts): depth_start, leaf_done,
 			admit (carrying the admitted Node, its parent and contribution) and
 			depth_end. Used e.g. to stream a live view of the growing tree.
+		on_path_evaluated (Callable, optional):
+			Observer called with (path, patched residual) after isolated
+			path scoring, before admission. Defaults to None.
 
 	Returns:
 		Node:
@@ -410,7 +419,7 @@ def TreeMessagePatching(
 				)
 				for candidate in candidates:
 					# Contribution of the branch C -> leaf -> ... -> root, on its own or in context.
-					score = _score_candidate(candidate, leaf, suffix, root, metric, joint)
+					score = _score_candidate(candidate, leaf, suffix, root, metric, joint, on_path_evaluated)
 					admitted = (score >= min_contribution) or (include_negative and abs(score) >= min_contribution)
 					level_scored += 1
 					_tlog.debug(
@@ -454,7 +463,8 @@ def TreeMessagePatching_LimitedLevelWidth(
 	max_width: int = 20000,
 	include_negative: bool = True,
 	joint_scoring: bool = False,
-	on_event: Callable = None,
+	on_event: Callable[[dict], None] | None = None,
+	on_path_evaluated: Callable[[list[Node], torch.Tensor], None] | None = None,
 ) -> Node:
 	"""Beam variant of TreeMessagePatching: instead of admitting every candidate
 	above a threshold, score all candidate extensions of all leaves at a depth and
@@ -486,6 +496,9 @@ def TreeMessagePatching_LimitedLevelWidth(
 			Observer called with progress events (dicts): depth_start, leaf_done,
 			admit and depth_end (see TreeMessagePatching). Admissions are emitted
 			after the per-depth pruning, when the survivors are attached.
+		on_path_evaluated (Callable, optional):
+			Observer called with (path, patched residual) after isolated
+			path scoring, before admission. Defaults to None.
 
 	Returns:
 		Node:
@@ -511,7 +524,7 @@ def TreeMessagePatching_LimitedLevelWidth(
 			for leaf_idx, leaf in enumerate(tqdm(frontier)):
 				suffix = get_path(leaf)
 				for candidate in leaf.get_expansion_candidates(model.cfg, include_head=True):
-					score = _score_candidate(candidate, leaf, suffix, root, metric, joint)
+					score = _score_candidate(candidate, leaf, suffix, root, metric, joint, on_path_evaluated)
 					if include_negative or score >= 0:
 						rank_value = abs(score.item()) if include_negative else score.item()
 						# A zero isolated contribution means the patch has no effect at
@@ -556,8 +569,9 @@ def PathMessagePatching(
 	return_all: bool = False,
 	batch_positions: bool = False,
 	batch_heads: bool = False,
-	max_time: float = None,
-	on_event: Callable = None
+	max_time: float | None = None,
+	on_event: Callable[[dict], None] | None = None,
+	on_path_evaluated: Callable[[list[Node], torch.Tensor], None] | None = None,
 ) -> list[tuple[torch.Tensor, list[Node]]]:
 	"""
 	Performs a Breadth-First Search (BFS) starting from a node backwards to identify
@@ -587,6 +601,10 @@ def PathMessagePatching(
 			Observer called with progress events (dicts): depth_start, leaf_done,
 			admit (a path continuation kept in the frontier) and path_complete
 			(a path that reached the embeddings).
+		on_path_evaluated (Callable, optional):
+			Observer called with (path, patched residual) after isolated
+			path scoring, before admission. Defaults to None.
+					
 	Returns:
 		A list of tuples containing the contribution score and the corresponding path,
 		sorted by contribution in descending order.
@@ -637,7 +655,8 @@ def PathMessagePatching(
 					if candidate.__class__.__name__ == 'EMBED_Node':
 						candidate.position = target_position if batch_positions else candidate.position
 
-						contribution = evaluate_path([candidate] + incomplete_path, metric)
+						contribution = evaluate_path([candidate] + incomplete_path, metric,
+							**({"on_evaluated": on_path_evaluated} if on_path_evaluated is not None else {}))
 						if return_all or (contribution >= min_contribution) or (include_negative and abs(contribution) >= min_contribution):
 							candidate.contribution = float(contribution)
 							candidate.discovery_index = len(completed_paths)
@@ -705,7 +724,7 @@ def PathMessagePatching_BestFirstSearch(
 			The number of paths to return.
 		max_time (int, default=300):
 			The maximum time (in seconds) to run the search.
-		include_negative (bool, default=False): 
+		include_negative (bool, default=True): 
 			If True, include paths with negative contributions. The min_contribution is therefore interpreted as a threshold on the magnitude of the contribution.
 		return_all (bool, default=False): 
 			If True, return all evaluated complete paths regardless of their contribution score. The search will still be guided by min_contribution.
@@ -793,8 +812,9 @@ def PathMessagePatching_LimitedLevelWidth(
 	include_negative: bool = True,
 	batch_positions: bool = False,
 	batch_heads: bool = False,
-	max_time: float = None,
-	on_event: Callable = None
+	max_time: float | None = None,
+	on_event: Callable[[dict], None] | None = None,
+	on_path_evaluated: Callable[[list[Node], torch.Tensor], None] | None = None,
 ) -> list[tuple[torch.Tensor, list[Node]]]:
 	"""
 	Performs a Breadth-First Search (BFS) starting from a node backwards to identify
@@ -813,7 +833,10 @@ def PathMessagePatching_LimitedLevelWidth(
 			Observer called with progress events (dicts): depth_start, leaf_done,
 			admit (a continuation that survived the per-depth pruning) and
 			path_complete (a path that reached the embeddings).
-		include_negative (bool, default=False): 
+		on_path_evaluated (Callable, optional):
+			Observer called with (path, patched residual) after isolated
+			path scoring, before admission. Defaults to None.
+		include_negative (bool, default=True): 
 			If True, include paths with negative contributions.
 		batch_positions (bool, default=False): 
 			If True, nodes are expanded without position-wise contributions, and only
@@ -825,6 +848,7 @@ def PathMessagePatching_LimitedLevelWidth(
 			Wall-clock budget in seconds. When exhausted the search returns the paths
 			completed so far and sets `root.timed_out`. Checked at every depth and
 			after every expanded leaf. Defaults to None (no limit).
+			
 	Returns:
 		A list of tuples containing the contribution score and the corresponding path, 
 		sorted by contribution in descending order.
@@ -871,7 +895,8 @@ def PathMessagePatching_LimitedLevelWidth(
 					if candidate.__class__.__name__ == 'EMBED_Node':
 						if batch_positions:
 							candidate.position = target_position
-						contribution = evaluate_path([candidate] + path, metric)
+						contribution = evaluate_path([candidate] + path, metric,
+							**({"on_evaluated": on_path_evaluated} if on_path_evaluated is not None else {}))
 						# Skip exact zeros: a path whose patch has no effect at all
 						# (identical clean/cf embedding) carries no information.
 						if (include_negative or contribution >= 0) and float(contribution) != 0:
@@ -969,7 +994,7 @@ def PathAttributionPatching(
 			The reference tokens used for evaluating path contributions.
 		min_contribution (float, default=0.5): 
 			The minimum absolute contribution score required for a path to be considered valid.
-		include_negative (bool, default=False): 
+		include_negative (bool, default=True): 
 			If True, include paths with negative contributions. The min_contribution is therefore interpreted as a threshold on the magnitude of the contribution.
 		return_all (bool, default=False): 
 			If True, return all evaluated paths regardless of their contribution score. The search will still be guided by min_contribution threshold.
@@ -1088,7 +1113,7 @@ def PathAttributionPatching_BestFirstSearch(
 				It must accept a single parameter corresponding to the corrupted residual stream just before the final layer norm.
 		root (Node): 
 			The initial node to begin the backward search from (e.g., FINAL_Node(layer=model.cfg.n_layers - 1, position=target_pos)).
-		include_negative (bool, default=False): 
+		include_negative (bool, default=True): 
 			If True, include paths with negative contributions, otherwise only return positively contributing paths. 
 			Note that to save computation the negatively contributing paths are discarded even if incomplete.
 		top_n (int, default=100):
@@ -1174,7 +1199,7 @@ def PathAttributionPatching_LimitedLevelWidth(
 				just before the final layer norm.
 		root (Node): 
 			The initial node to begin the backward search from (e.g., FINAL_Node(layer=model.cfg.n_layers - 1, position=target_pos)).
-		include_negative (bool, default=False): 
+		include_negative (bool, default=True): 
 			If True, include paths with negative contributions, otherwise only return positively contributing paths. 
 			Note that to save computation the negatively contributing paths are discarded even if incomplete.
 		max_width (int, default=20000):

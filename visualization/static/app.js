@@ -289,10 +289,9 @@ function loadGraph(graph, graphState = state, shouldRender = true) {
 
 /* -------------------------------------------------------- node exploration */
 
-function setPathInfoOpen(open, pinned = false) {
+function setPathInfoOpen(open) {
 	$("#path-info-popover").hidden = !open;
 	$("#path-info").setAttribute("aria-expanded", String(open));
-	$("#path-info").dataset.pinned = String(open && pinned);
 }
 
 function setComponentDecodingInfoOpen(open) {
@@ -365,12 +364,16 @@ function updatePathControls() {
 	$("#path-sort-current").textContent = orderLabel;
 	$("#path-sort-toggle").setAttribute("aria-label", `Sort paths. Current order: ${orderLabel}`);
 	$("#path-legend-row").hidden = !hasPaths;
+	$("#path-sort-wrap").hidden = !hasPaths;
 	$("#path-score-context").hidden = !hasPaths;
+	PathProbabilities.renderGuide($("#path-probability-guide"), hasPaths ? state.result?.meta : null,
+		hasPaths ? explorer.listedPaths() : [], state.result?.params);
 	if (!hasPaths) setPathSortOpen(false);
 	$("#path-explorer").hidden = !active;
 	$("#app").classList.toggle("exploring-paths", active);
 	$("#threshold-slider").disabled = Boolean(hasPaths);
 	const list = $("#path-list");
+	for (const entry of state.pathEntries.values()) PathProbabilities.dispose(entry.probabilities);
 	list.replaceChildren();
 	state.pathEntries.clear();
 	if (!active) {
@@ -385,6 +388,13 @@ function updatePathControls() {
 		const row = document.createElement("div");
 		row.setAttribute("class", "path-entry");
 		row.dataset.pathId = path.id;
+		row.addEventListener("click", (event) => {
+			// Keep the native selection button in charge of its own clicks.
+			if (!event.target.closest("button")) selectPath(path.id);
+		});
+		const info = document.createElement("div");
+		info.setAttribute("class", "path-card-info");
+		row.appendChild(info);
 		const button = document.createElement("button");
 		button.setAttribute("class", "path-select");
 		button.type = "button";
@@ -398,7 +408,7 @@ function updatePathControls() {
 		score.setAttribute("class", "path-score");
 		score.textContent = PathPresentation.formatScore(path.score);
 		const presentation = PathExploration.scorePresentation(path, state.result?.meta);
-		score.title = presentation.tooltip;
+		score.title = `${presentation.text}\n${presentation.tooltip}`;
 		score.setAttribute("aria-label", presentation.text);
 		heading.appendChild(number);
 		heading.appendChild(score);
@@ -409,16 +419,15 @@ function updatePathControls() {
 		button.appendChild(heading);
 		button.appendChild(summary);
 		button.appendChild(note);
-		row.appendChild(button);
-		const details = document.createElement("details");
-		details.setAttribute("class", "path-difference-details");
-		const inspect = document.createElement("summary");
-		const changes = document.createElement("ul");
-		details.appendChild(inspect);
-		details.appendChild(changes);
-		row.appendChild(details);
+		info.appendChild(button);
+		const probabilities = document.createElement("section");
+		probabilities.setAttribute("class", "path-probabilities");
+		probabilities.setAttribute("aria-label", `Path ${path.ordinal} final prediction probability comparison`);
+		row.appendChild(probabilities);
 		list.appendChild(row);
-		state.pathEntries.set(path.id, { button, summary, note, details, inspect, changes });
+		PathProbabilities.render(probabilities, path, state.result?.meta,
+			{ sharedGuide: true, params: state.result?.params, scale: state.result?.probabilityScale });
+		state.pathEntries.set(path.id, { row, button, summary, note, probabilities });
 	}
 	list.scrollTop = 0;
 	updatePathSelectionControls();
@@ -465,19 +474,20 @@ function selectPathComponent(path, index) {
 function updatePathSelectionControls(scrollSelected = false) {
 	const explorer = state.pathExplorer;
 	const reference = explorer?.index.paths.get(explorer.selectedId);
-	const visibleDifferences = 4;
 	for (const [id, entry] of state.pathEntries) {
 		const path = explorer.index.paths.get(id);
 		const selected = id === reference?.id;
 		entry.button.setAttribute("aria-pressed", String(selected));
+		entry.row.setAttribute("data-selected", String(selected));
 		const comparison = PathExploration.comparePaths(reference, path);
 		const diffs = comparison.differences;
-		const labels = selected ? ["Selected reference"] : diffs.length ? diffs.slice(0, visibleDifferences).map(PathPresentation.differenceLabel)
+		const labels = selected ? ["Selected reference"] : diffs.length ? diffs.map(PathPresentation.differenceLabel)
 			: [comparison.metadataIncomplete ? "No differences in available metadata" : "Same components and patching"];
 		entry.summary.replaceChildren();
-		for (const label of labels) {
+		for (const [i, label] of labels.entries()) {
 			const line = document.createElement("span");
 			line.textContent = label;
+			if (!selected && diffs[i]) line.dataset.type = diffs[i].type;
 			entry.summary.appendChild(line);
 		}
 		const notes = [];
@@ -488,15 +498,6 @@ function updatePathSelectionControls(scrollSelected = false) {
 		if (scoreNote) notes.push(scoreNote);
 		entry.note.textContent = notes.join(" · ");
 		entry.note.hidden = notes.length === 0;
-		entry.details.hidden = selected || diffs.length <= visibleDifferences;
-		entry.inspect.textContent = `Inspect remaining differences (${Math.max(0, diffs.length - visibleDifferences)} more)`;
-		entry.changes.replaceChildren();
-		for (const diff of diffs.slice(visibleDifferences)) {
-			const item = document.createElement("li");
-			item.dataset.type = diff.type;
-			item.textContent = PathPresentation.differenceLabel(diff);
-			entry.changes.appendChild(item);
-		}
 		if (scrollSelected && selected) entry.button.scrollIntoView({ block: "nearest" });
 	}
 	updateSelectedPathDiagram(reference || null);
@@ -990,20 +991,12 @@ function setupPathInspector() {
 	sortWrap.addEventListener("focusout", (event) => {
 		if (!sortWrap.contains(event.relatedTarget)) setPathSortOpen(false);
 	});
-	const previewInfo = () => {
-		setPathSortOpen(false);
-		if (info.dataset.pinned !== "true") setPathInfoOpen(true);
-	};
-	const dismissPreview = () => {
-		if (info.dataset.pinned !== "true") setPathInfoOpen(false);
-	};
-	infoWrap.addEventListener("pointerenter", previewInfo);
-	infoWrap.addEventListener("pointerleave", dismissPreview);
-	info.addEventListener("focus", previewInfo);
-	info.addEventListener("blur", dismissPreview);
 	info.addEventListener("click", () => {
-		const open = info.dataset.pinned !== "true";
-		setPathInfoOpen(open, open);
+		setPathSortOpen(false);
+		setPathInfoOpen($("#path-info-popover").hidden);
+	});
+	infoWrap.addEventListener("focusout", (event) => {
+		if (!infoWrap.contains(event.relatedTarget)) setPathInfoOpen(false);
 	});
 	document.addEventListener("pointerdown", (event) => {
 		if (!decodingInfoWrap.contains(event.target)) setComponentDecodingInfoOpen(false);
@@ -1417,8 +1410,9 @@ function restoreSavedResult(method) {
 	clearDisplay();
 	state.meta = { ...saved.meta };
 	loadGraph(saved.graph);
-	state.result = { graph: saved.graph, meta: saved.meta };
+	state.result = { graph: saved.graph, meta: saved.meta, params: saved.params };
 	state.pathExplorer = new PathExploration.Explorer(PathExploration.buildIndex(saved.graph, method));
+	state.result.probabilityScale = PathProbabilities.scaleFor(state.pathExplorer.index.paths.values(), saved.meta);
 	restoreParams(saved.params, method);
 	showSummary(saved.meta);
 	updatePathControls();
@@ -1519,6 +1513,7 @@ function showSummary(meta) {
 		bits.push(`ACDC kept <b>${meta.acdc_edges}</b> of ${meta.acdc_initial_edges} hook-level edges`);
 		bits.push(`final metric <b>${meta.final_metric.toFixed(4)}</b>`);
 	}
+	if (meta.method === "acdc") bits.push("Path probabilities unavailable: ACDC's collapsed graph does not retain isolated path interventions.");
 	$("#summary").innerHTML = bits.join("<br>");
 	const slider = $("#threshold-slider");
 	slider.max = state.maxAbs.toFixed(3);

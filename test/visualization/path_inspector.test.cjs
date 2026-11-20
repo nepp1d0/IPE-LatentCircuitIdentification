@@ -8,6 +8,7 @@ const P = require("../../visualization/static/path_exploration.js");
 const PathDiagram = require("../../visualization/static/path_diagram.js");
 const PathPresentation = require("../../visualization/static/path_presentation.js");
 const ComponentDecoding = require("../../visualization/static/component_decoding.js");
+const PathProbabilities = require("../../visualization/static/path_probabilities.js");
 const { fixture, occurrenceFixture } = require("./path_fixtures.cjs");
 
 /* Minimal SVG/DOM harness: exercise the actual app's rendering/event handlers
@@ -115,7 +116,7 @@ function appHarness(inspectorWidth = "480px") {
 		}
 		window.emit("resize");
 	};
-	const context = vm.createContext({ PathExploration: P, PathDiagram, PathPresentation, ComponentDecoding, console,
+	const context = vm.createContext({ PathExploration: P, PathDiagram, PathPresentation, ComponentDecoding, PathProbabilities, console,
 		EventSource: class { close() {} },
 		document,
 		window,
@@ -193,28 +194,41 @@ test("header handles all-token/all-head metadata and singular complete path coun
 	assert.equal(app.state.pathExplorer.selectedId, "path-1");
 });
 
-test("header information supports hover, pinned click, keyboard and outside dismissal", () => {
+test("header information opens only on click, ignores hover/focus, and preserves dismissal", () => {
 	const app = appHarness();
 	app.state.savedResults.path = saved(fixture());
 	app.restoreSavedResult("path");
 	app.onClickNode({ id: "a" });
 	const wrap = app.get("#path-info-wrap"), info = app.get("#path-info"), popover = app.get("#path-info-popover");
+	app.get("#path-sort-toggle").emit("click");
 	wrap.emit("pointerenter");
-	assert.equal(popover.hidden, false);
-	assert.equal(info.attrs["aria-expanded"], "true");
+	info.emit("pointerenter");
+	info.emit("focus");
+	assert.equal(popover.hidden, true, "neither hover nor focus opens information");
+	assert.equal(info.attrs["aria-expanded"], "false");
+	assert.equal(app.get("#path-sort-popover").hidden, false, "hover/focus do not affect other controls");
 	wrap.emit("pointerleave");
+	info.emit("blur");
 	assert.equal(popover.hidden, true);
 	info.emit("click");
+	assert.equal(app.get("#path-sort-popover").hidden, true);
+	assert.equal(info.attrs["aria-expanded"], "true");
 	wrap.emit("pointerleave");
 	assert.equal(popover.hidden, false);
 	app.document.emit("pointerdown", { target: info });
 	assert.equal(popover.hidden, false);
+	wrap.emit("focusout", { relatedTarget: popover });
+	assert.equal(popover.hidden, false, "focus within the information wrapper does not dismiss it");
+	info.emit("click");
+	assert.equal(popover.hidden, true, "a second click closes information");
+	info.emit("click");
 	app.document.emit("keydown", { key: "Escape" });
 	assert.equal(popover.hidden, true);
 	info.emit("focus");
-	assert.equal(popover.hidden, false);
-	info.emit("blur");
-	assert.equal(popover.hidden, true);
+	assert.equal(popover.hidden, true, "focus after Escape cannot reopen information");
+	info.emit("click");
+	wrap.emit("focusout", { relatedTarget: app.get("#path-clear") });
+	assert.equal(popover.hidden, true, "leaving the wrapper dismisses information like Component Decoding");
 	info.emit("click");
 	app.document.emit("pointerdown", { target: app.get("#grid") });
 	assert.equal(popover.hidden, true);
@@ -434,13 +448,14 @@ test("sidebar summaries disambiguate Q/KV paths that have identical display geom
 	assert.match(pathButtons(app)[2].textContent, /A0H0: Q → KV/);
 	assert.match(pathButtons(app)[2].textContent, /Same route · different patching/);
 	assert.match(pathButtons(app)[2].textContent, /source: all eligible → 0/);
-	assert.equal(app.state.pathEntries.get("path-3").details.hidden, true, "two fully visible differences need no redundant expander");
+	assert.equal(app.state.pathEntries.get("path-3").summary.children.length, 2);
+	assert.equal(app.get("#path-list").querySelectorAll("details").length, 0);
 	pathButtons(app)[2].emit("click");
 	assert.match(pathButtons(app)[0].textContent, /A0H0: KV → Q/);
 	assert.equal(app.get("#selected-path-meta").textContent, "Path 3");
 });
 
-test("only additional differences expand, and update against the new reference without losing expansion state", () => {
+test("every difference is directly visible and updates against the new reference without an expander", () => {
 	const app = appHarness();
 	const graph = occurrenceFixture();
 	graph.path_provenance.paths[0].score = 0;
@@ -453,31 +468,49 @@ test("only additional differences expand, and update against the new reference w
 	app.onClickNode({ id: "a" });
 	const entry = app.state.pathEntries.get("path-3");
 	assert.deepEqual(entry.summary.children.map((n) => n.textContent), ["A0H0: Q → KV", "A0H0 source: all eligible → 0", "A0H0 patch: zero → counterfactual"]);
-	assert.equal(entry.details.hidden, true, "all three differences are directly visible");
-	assert.equal(entry.changes.children.length, 0);
+	assert.equal(entry.row.querySelectorAll("details").length, 0);
 	pathButtons(app)[1].emit("click");
-	assert.equal(entry.summary.children.length, 4);
-	assert.equal(entry.details.hidden, false);
-	assert.equal(entry.inspect.textContent, "Inspect remaining differences (1 more)");
-	assert.equal(entry.changes.children.length, 1);
+	assert.equal(entry.summary.children.length, 5);
 	const allLabels = P.comparePaths(app.state.pathExplorer.index.paths.get("path-2"), app.state.pathExplorer.index.paths.get("path-3"))
 		.differences.map(PathPresentation.differenceLabel);
-	assert.deepEqual([...entry.summary.children, ...entry.changes.children].map((n) => n.textContent), allLabels, "every difference keeps its original order");
-	entry.details.open = true;
+	assert.deepEqual(entry.summary.children.map((n) => n.textContent), allLabels, "every difference keeps its original order");
+	assert.doesNotMatch(entry.row.textContent, /Inspect remaining|\(\d+ more\)/);
 	pathButtons(app)[4].emit("click");
 	assert.equal(entry.summary.children.length, 4);
-	assert.equal(entry.details.hidden, true, "exactly four differences need no expander");
-	assert.equal(entry.changes.children.length, 0);
 	pathButtons(app)[1].emit("click");
-	assert.equal(entry.details.open, true);
-	assert.equal(entry.details.hidden, false);
-	assert.equal(entry.changes.children.length, 1);
+	assert.equal(entry.summary.children.length, 5);
 	pathButtons(app)[2].emit("click");
-	assert.equal(entry.details.hidden, true);
+	assert.equal(entry.summary.textContent, "Selected reference");
+	assert.equal(app.get("#path-list").querySelectorAll("summary").length, 0);
 	assert.match(pathButtons(app)[0].textContent, /\+0/);
 	assert.match(pathButtons(app)[0].textContent, /Scoring mode unknown/);
 	assert.equal(pathButtons(app)[2].querySelectorAll(".path-score")[0].textContent, "−0.123");
 	assert.equal(app.get("#selected-path-meta").textContent, "Path 3");
+	assert.equal(JSON.stringify(graph), original);
+});
+
+test("all Added/Removed changes remain visible beyond four entries and reverse with path selection", () => {
+	const app = appHarness(), graph = fixture();
+	graph.path_provenance.paths[0].node_ids = ["e0", "b", "c", "spare", "second-head", "a", "f"];
+	graph.path_provenance.paths[2].node_ids = ["e1", "a", "f"];
+	for (const path of graph.path_provenance.paths) for (let i = 1; i < path.node_ids.length; i++) {
+		graph.edges.push({ source: path.node_ids[i-1], target: path.node_ids[i], complete: true });
+	}
+	const original = JSON.stringify(graph);
+	app.state.savedResults.path = saved(graph); app.restoreSavedResult("path"); app.onClickNode({ id: "a" });
+	const check = (id, type) => {
+		const path = app.state.pathExplorer.index.paths.get(id);
+		const reference = app.state.pathExplorer.index.paths.get(app.state.pathExplorer.selectedId);
+		const changes = P.comparePaths(reference, path).differences;
+		assert.ok(changes.length > 4);
+		const lines = app.state.pathEntries.get(id).summary.children;
+		assert.deepEqual(lines.map((n) => n.textContent), changes.map(PathPresentation.differenceLabel));
+		assert.ok(lines.filter((n) => n.dataset.type === type).length >= 4);
+		assert.ok(lines.filter((n) => n.dataset.type === type).every((n) => n.textContent.startsWith(type === "added" ? "Added " : "Removed ")));
+	};
+	check("path-3", "removed");
+	pathButtons(app)[2].emit("click"); check("path-1", "added");
+	app.get("#path-sort").children[2].emit("click"); check("path-1", "added");
 	assert.equal(JSON.stringify(graph), original);
 });
 
@@ -998,6 +1031,147 @@ describe("Component decoding within the selected path", () => {
 		app.restoreSavedResult("path");
 		assert.equal(app.get("#selected-path-details").hidden, true);
 		assert.equal(app.get("#selected-path-diagram").children.length, 0);
+	});
+});
+
+describe("Always-visible final path probabilities", () => {
+
+	function probabilityResult(method = "path", job = "job-1", mode = "noising") {
+		const graph = fixture(method), result = saved(graph, method);
+		Object.assign(result.meta, { mode, metric: "logit_difference", probability_context: {
+			available: true, id: job, method, mode, top_k: 5, prompt_index: 0,
+			reference_label: mode === "denoising" ? "Counterfactual" : "Clean",
+			position: 1, reference_prompt: "saved prompt", target_token_id: 10, counterfactual_token_id: 11,
+		} });
+		graph.path_provenance.paths.forEach((p, i) => {
+			p.occurrence_ids = p.node_ids.map((id) => `${p.id}-${id}`);
+			p.probability_comparison = { available: true, convention: "isolated_path_final_output_softmax",
+				context_id: job, path_id: p.id, position: 1, vocab_size: 100,
+				node_ids: [...p.node_ids], occurrence_ids: [...p.occurrence_ids],
+				tokens: [10, 11, 12, 13, 14].map((token_id, j) => ({ token_id,
+					token: ` ${job}-${i}-${j}`, reference: (5 - j) / 100, patched: (6 - j) / 100, delta: .01 })) };
+		});
+		return result;
+	}
+	const charts = (app) => app.get("#path-list").querySelectorAll(".path-probability-chart");
+
+	for (const method of ["tree", "path"]) test(`${method}: the result-wide axis includes offscreen paths and stays stable through navigation and sorting`, () => {
+		const app = appHarness(), result = probabilityResult(method);
+		// The first path is absent when inspecting e1, but still sets the axis.
+		const high = result.graph.path_provenance.paths[0].probability_comparison;
+		high.tokens.forEach((t, i) => { t.reference = i ? 0 : .4; t.patched = i ? 0 : .61; t.delta = t.patched - t.reference; });
+		const before = JSON.stringify(result);
+		app.state.savedResults[method] = result; app.restoreSavedResult(method);
+		const scale = app.state.result.probabilityScale;
+		assert.equal(scale.maximum, .8);
+		for (const node of ["a", "e1", "e0", "a"]) {
+			app.onClickNode({ id: node });
+			for (const button of pathButtons(app)) button.emit("click");
+			for (const option of app.get("#path-sort").children) {
+				option.emit("click");
+				assert.equal(app.state.result.probabilityScale, scale, "scale is not recomputed by UI navigation");
+				assert.ok(charts(app).length > 0);
+				assert.ok(charts(app).every((chart) => chart.dataset.axisMax === "0.8"));
+			}
+		}
+		app.get("#path-list").scrollTop = 200;
+		app.get("#path-list").emit("scroll");
+		app.get("#path-clear").emit("click");
+		app.state.threshold = .2; app.render(); app.onClickNode({ id: "e1" });
+		assert.equal(app.state.result.probabilityScale, scale, "scrolling/filtering do not recalculate the axis");
+		assert.ok(charts(app).every((chart) => chart.dataset.axisMax === "0.8"));
+		assert.equal(JSON.stringify(result), before);
+		app.state.savedResults[method] = probabilityResult(method, "new-result");
+		app.restoreSavedResult(method); app.onClickNode({ id: "a" });
+		assert.notEqual(app.state.result.probabilityScale, scale);
+		assert.ok(app.state.result.probabilityScale.maximum < .8, "new result recalculates its own scale");
+	});
+	for (const method of ["tree", "path"]) test(`${method}: every visible path has five pairs before any path/component interaction`, () => {
+		const app = appHarness(), result = probabilityResult(method), original = JSON.stringify(result);
+		app.state.savedResults[method] = result;
+		app.restoreSavedResult(method);
+		app.onClickNode({ id: "a" });
+		assert.equal(charts(app).length, 7);
+		assert.equal(app.state.componentSelection, null);
+		for (const entry of app.state.pathEntries.values()) {
+			assert.equal(entry.probabilities.querySelectorAll(".path-probability-bar").length, 10);
+			assert.equal(entry.probabilities.querySelectorAll(".path-probability-value").length, 10);
+			assert.equal(entry.probabilities.querySelectorAll(".path-probability-token").length, 5);
+			assert.equal(entry.probabilities.querySelectorAll(".path-probability-heading").length, 1);
+			assert.match(entry.probabilities.textContent, /Final prediction probabilitiesTop 5 by \|Δp\| · sorted by clean P/);
+			assert.notEqual(entry.probabilities.parent, entry.button);
+			assert.equal(entry.row.querySelectorAll("details").length, 0);
+			assert.notEqual(entry.probabilities.hidden, true);
+			assert.equal(entry.probabilities.parent, entry.row);
+			assert.equal(entry.button.parent.parent, entry.row);
+			assert.equal(entry.button.querySelectorAll(".path-card-heading")[0].children[1].classList.contains("path-score"), true);
+		}
+		const oldCharts = charts(app);
+		pathButtons(app)[5].emit("click");
+		assert.equal(app.state.pathEntries.get(`${method}-6`).row.dataset.selected, "true");
+		assert.equal(app.state.pathEntries.get(`${method}-1`).row.dataset.selected, "false");
+		const entry = app.state.pathEntries.get(`${method}-3`);
+		entry.row.emit("click", { target: entry.probabilities });
+		assert.equal(app.state.pathExplorer.selectedId, `${method}-3`, "clicking the chart follows normal path selection");
+		assert.equal(entry.row.dataset.selected, "true");
+		assert.equal(app.get("#path-probability-guide").querySelectorAll(".path-probability-legend").length, 1);
+		assert.equal(app.get("#path-probability-guide").textContent, "CleanPatchedTargetCounterfactualOther");
+		assert.equal(app.get("#path-list").querySelectorAll(".path-probability-legend").length, 0);
+		assert.deepEqual(charts(app), oldCharts, "selection does not redraw or flicker charts");
+		app.get("#path-sort").children[2].emit("click");
+		assert.equal(charts(app).length, 7);
+		assert.equal(JSON.stringify(result), original);
+	});
+
+	test("visual whitespace fallback uses the saved request labels, not later form edits", () => {
+		const app = appHarness(), result = probabilityResult();
+		Object.assign(result.meta.probability_context, { target_token_id: 24119, counterfactual_token_id: 7554 });
+		result.params = { model: "gpt2-small", method: "path", mode: "noising", prompts: ["saved prompt"],
+			targets: ["Mary"], cf_prompts: ["saved counterfactual"], cf_targets: ["John"] };
+		for (const path of result.graph.path_provenance.paths) {
+			path.probability_comparison.vocab_size = 50257;
+			Object.assign(path.probability_comparison.tokens[0], { token_id: 5335, token: " Mary" });
+			Object.assign(path.probability_comparison.tokens[1], { token_id: 1757, token: " John" });
+		}
+		const original = JSON.stringify(result);
+		app.state.savedResults.path = result;
+		app.restoreSavedResult("path");
+		app.get("#targets").value = "Alice"; app.get("#cf-targets").value = "Bob";
+		app.onClickNode({ id: "a" });
+		const groups = app.get("#path-list").querySelectorAll(".path-probability-bar-group");
+		assert.deepEqual(groups.slice(0, 4).map((g) => [g.dataset.role, g.dataset.roleMatch]),
+			[["target", "leading-space"], ["target", "leading-space"], ["counterfactual", "leading-space"], ["counterfactual", "leading-space"]]);
+		assert.equal(JSON.stringify(result), original);
+		assert.equal(app.get("#path-probability-guide").textContent, "CleanPatchedTargetCounterfactualOther");
+		assert.match(pathButtons(app)[0].querySelectorAll(".path-score")[0].title, /Logit Difference/);
+	});
+
+	test("saved metrics, methods, prompts and results bind readouts without leaking earlier charts", () => {
+		const app = appHarness();
+		for (const metric of ["logit_difference", "kl_divergence", "target_logit_percentage", "target_probability_percentage", "indirect_effect"]) {
+			const result = probabilityResult(); result.meta.metric = metric;
+			app.state.savedResults.path = result; app.restoreSavedResult("path"); app.onClickNode({ id: "a" });
+			assert.equal(charts(app).length, 7, metric);
+		}
+		app.state.savedResults.tree = probabilityResult("tree", "job-2", "denoising");
+		Object.assign(app.state.savedResults.tree.meta.probability_context, { target_token_id: 11, counterfactual_token_id: 10 });
+		app.selectMethod("tree");
+		assert.equal(charts(app).length, 0);
+		app.onClickNode({ id: "a" });
+		assert.match(app.get("#path-probability-guide").textContent, /Counterfactual ref\.Patched/);
+		assert.match(app.get("#path-list").textContent, /job-2/);
+		assert.doesNotMatch(app.get("#path-list").textContent, /job-1/);
+		assert.deepEqual(app.get("#path-list").querySelectorAll(".path-probability-bar-group").slice(0, 4).map((g) => g.dataset.role),
+			["counterfactual", "counterfactual", "target", "target"], "new results use their own role IDs, not the earlier chart's roles");
+		const changed = probabilityResult("tree", "job-3");
+		changed.meta.probability_context.reference_prompt = "different prompt";
+		changed.graph.path_provenance.paths[0].probability_comparison.context_id = "job-2";
+		delete changed.graph.path_provenance.paths[1].probability_comparison;
+		app.state.savedResults.tree = changed; app.restoreSavedResult("tree"); app.onClickNode({ id: "a" });
+		assert.equal(charts(app).length, 5);
+		assert.match(app.get("#path-list").textContent, /mismatched or stale/);
+		assert.doesNotMatch(app.get("#path-list").textContent, /job-2-/);
+		app.clearDisplay(); assert.equal(charts(app).length, 0);
 	});
 });
 
