@@ -70,6 +70,7 @@ test("Inspector container width and Clear/header stability preserve manual circu
 	timeout: 60000,
 }, async () => {
 	const root = path.resolve(__dirname, "../../visualization");
+	const inferenceRequests = [];
 	const server = http.createServer((req, res) => {
 		res.setHeader("Cache-Control", "no-store");
 		if (req.url === "/api/config") {
@@ -77,6 +78,7 @@ test("Inspector container width and Clear/header stability preserve manual circu
 			return res.end(JSON.stringify({ models: ["gpt2-small"], metrics: ["logit_difference"],
 				denoising_metrics: ["logit_difference"], acdc_metrics: ["kl_div"], device: "test" }));
 		}
+		if (req.url.startsWith("/api/")) inferenceRequests.push(req.url);
 		const name = req.url === "/" ? "static/index.html" : req.url.split("?")[0];
 		const file = path.join(root, name);
 		if (!file.startsWith(root + path.sep) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -170,15 +172,26 @@ test("Inspector container width and Clear/header stability preserve manual circu
 		await viewport(1440);
 		await send("Page.navigate", { url: `http://127.0.0.1:${server.address().port}/` });
 		await delay(350);
+		assert.equal(await evaluate(`document.querySelector('#load-graph').getBoundingClientRect().height > 0`), true,
+			"import must be available before any discovery result");
 		const tokens = Array.from({ length: 11 }, (_, i) => String(i));
 		tokens[0] = "<BOS>";
 		tokens[3] = " long" + "🧠WideUnbrokenToken".repeat(25);
 		tokens[7] = ' <script>window.badToken=true</script><img src=x onerror="window.badToken=true">&"';
 		tokens[10] = " to";
-		await evaluate(`state.savedResults.path={graph:${JSON.stringify(graphFixture())},meta:{method:'path',positional:true,
+		await evaluate(`globalThis.importFixture={graph:${JSON.stringify(graphFixture())},meta:{method:'path',positional:true,
 			tokens:${JSON.stringify(tokens)},cf_tokens:Array(11).fill('WRONG_COUNTERFACTUAL_TOKEN'),
 			n_layers:7,n_heads:12,metric:'logit_difference',mode:'denoising'},params:null};
-			restoreSavedResult('path');state.view={x:87,y:-46,k:1.37};onClickNode({id:'a'});render();`);
+			const transfer=new DataTransfer();
+			transfer.items.add(new File([JSON.stringify(importFixture)],'ipe_circuit.json',{type:'application/json'}));
+			const input=document.querySelector('#graph-file');input.files=transfer.files;
+			input.dispatchEvent(new Event('change',{bubbles:true}));`);
+		await delay(100);
+		assert.equal(await evaluate(`document.querySelector('#graph-import-error').hidden`), true);
+		assert.equal(await evaluate(`document.querySelector('#graph-file').value`), "", "native file input resets for retries");
+		assert.equal(await evaluate(`JSON.stringify(state.result.graph) === JSON.stringify(importFixture.graph)`), true);
+		assert.deepEqual(inferenceRequests, [], "local File import must not call model APIs");
+		await evaluate(`state.view={x:87,y:-46,k:1.37};onClickNode({id:'a'});render();`);
 		const initial = await measure();
 		assert.equal(initial.panel[2], 480, "the actual panel container, not only its contents, must be 480px");
 		const [x, y, w, h] = initial.actions[0];

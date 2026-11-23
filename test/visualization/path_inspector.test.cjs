@@ -68,6 +68,8 @@ class Element {
 
 function appHarness(inspectorWidth = "480px") {
 	const elements = new Map();
+	const requests = [], timeouts = new Map();
+	let timerId = 0;
 	const get = (selector) => {
 		if (selector === "#viewport") {
 			return elements.get("#grid")?.children.find((child) => child.attrs.id === "viewport") || null;
@@ -118,18 +120,23 @@ function appHarness(inspectorWidth = "480px") {
 	};
 	const context = vm.createContext({ PathExploration: P, PathDiagram, PathPresentation, ComponentDecoding, PathProbabilities, console,
 		EventSource: class { close() {} },
+		fetch: async (...args) => { requests.push(args); throw new Error("Unexpected network request"); },
 		document,
 		window,
 		getComputedStyle: () => ({ getPropertyValue: (key) => ({ "--pos": "#5A92BF", "--neg": "#BF4D43", "--mid": "#E8E6DC",
 			"--path-inspector-width": inspectorWidth })[key] }),
-		setInterval() {}, setTimeout() {}, clearTimeout() {}, performance: { now: () => 1000 },
+		setInterval() {},
+		setTimeout(fn) { timeouts.set(++timerId, fn); return timerId; },
+		clearTimeout(id) { timeouts.delete(id); },
+		performance: { now: () => 1000 },
 	});
 	const source = fs.readFileSync(require.resolve("../../visualization/static/app.js"), "utf8").replace(/\ninit\(\);\s*$/, "");
 	vm.runInContext(source + `\nglobalThis.app = { state, render, clearHover, clearDisplay, onClickNode,
 		restoreSavedResult, selectMethod, setupPanZoom, openStream, attachLiveGraph,
-		createLiveGraphState, init }; loadConfig = async () => {};`, context);
+		createLiveGraphState, importGraphFile, setRunning, init }; loadConfig = async () => {};`, context);
 	context.app.init();
-	return { ...context.app, get, document, resizeWindow };
+	return { ...context.app, get, document, resizeWindow, requests,
+		async flushTimeouts() { const callbacks = [...timeouts.values()]; timeouts.clear(); await Promise.all(callbacks.map((fn) => fn())); } };
 }
 
 function saved(graph, method = "path") {
@@ -145,6 +152,231 @@ function snapshotGraph(get) {
 }
 
 const pathButtons = (app) => app.get("#path-list").querySelectorAll(".path-select");
+
+describe("Local graph JSON import", () => {
+	function exportedResult(method = "path", mode = "noising") {
+		const graph = occurrenceFixture(), result = saved(graph, method);
+		graph.path_provenance.source = method;
+		Object.assign(result.meta, { strategy: "topk", mode, metric: "logit_difference", runtime: 1.5,
+			n_nodes: graph.nodes.length, n_edges: graph.edges.length, joint_tree_contribution: method === "tree" ? 0.8 : null,
+			probability_context: { available: true, id: "exported-job", method, mode, top_k: 1, prompt_index: 0,
+				reference_label: mode === "denoising" ? "Counterfactual" : "Clean", position: 1,
+				reference_prompt: mode === "denoising" ? "counterfactual prompt" : "saved prompt",
+				target_token_id: 10, counterfactual_token_id: 11 } });
+		result.params = { model: "gpt2-small", method, strategy: "topk", mode,
+			prompts: ["saved prompt", "second prompt"], targets: [" target", " other"],
+			cf_prompts: ["counterfactual prompt", "second counterfactual"], cf_targets: [" wrong", " wrong"],
+			metric: "logit_difference", positional: true, include_negative: false,
+			min_contribution: 0.03, max_width: 12, acdc_metric: "kl_div", acdc_threshold: 0.1, acdc_abs_threshold: false };
+		graph.path_provenance.paths.forEach((path, i) => {
+			path.score = i === 0 ? 0 : -i / 4;
+			path.score_kind = "isolated_path_effect";
+			path.probability_comparison = { available: true, convention: "isolated_path_final_output_softmax",
+				context_id: "exported-job", path_id: path.id, position: 1, vocab_size: 100,
+				node_ids: [...path.node_ids], occurrence_ids: [...path.occurrence_ids],
+				tokens: [{ token_id: 10, token: " target", reference: .2, patched: i ? .1 : .61, delta: i ? -.1 : .41 }] };
+		});
+		for (const node of graph.nodes.filter((n) => ["attn", "mlp"].includes(n.kind))) {
+			node.component_logit_lens = { available: true, convention: "isolated_component_softmax",
+				position: node.position, position_token: result.meta.tokens[node.position],
+				top_tokens: [{ token: " decoded", probability: .25 }] };
+		}
+		return result;
+	}
+	const file = (data) => ({ name: "ipe_circuit.json", text: async () => JSON.stringify(data) });
+
+	for (const method of ["tree", "path"]) for (const mode of ["noising", "denoising"]) {
+		test(`${method}/${mode}: imports exported graph, scores, probabilities, decoding and parameters without requests`, async () => {
+			const source = appHarness(), result = exportedResult(method, mode);
+			source.state.savedResults[method] = result;
+			source.restoreSavedResult(method);
+			source.render();
+			// The download button serializes state.result, including the derived probabilityScale.
+			const exported = JSON.stringify(source.state.result);
+			const app = appHarness();
+			app.get("#prompts").value = "pending preview";
+			app.get("#prompts").emit("input");
+			await app.importGraphFile({ name: "ipe_circuit.json", text: async () => exported });
+			await app.flushTimeouts();
+			app.render();
+			assert.equal(app.get("#graph-import-error").hidden, true);
+			assert.equal(app.state.method, method);
+			assert.equal(app.state.result.meta.mode, mode);
+			assert.equal(app.state.result.meta.runtime, 1.5);
+			assert.equal(app.state.threshold, 0);
+			assert.equal(JSON.stringify(app.state.result.graph), JSON.stringify(result.graph));
+			assert.equal(JSON.stringify(app.state.result.params), JSON.stringify(result.params));
+			assert.deepEqual(snapshotGraph(app.get), snapshotGraph(source.get));
+			assert.equal(app.state.result.probabilityScale.maximum, .8);
+			assert.equal(app.get("#model").value, result.params.model);
+			assert.equal(app.get("#prompts").value, "saved prompt\nsecond prompt");
+			assert.equal(app.get("#targets").value, " target\n other");
+			assert.equal(app.get("#cf-prompts").value, "counterfactual prompt\nsecond counterfactual");
+			assert.equal(app.get("#max-width").value, 12);
+			assert.equal(app.get("#include-negative").checked, false);
+			assert.equal(app.state.strategy, "topk");
+			assert.equal(app.state.mode, mode);
+			assert.equal(app.get("#download").hidden, false);
+			app.onClickNode({ id: "a" });
+			app.render();
+			assert.equal(app.get("#path-list").children.length, 7);
+			assert.equal(app.get("#path-list").querySelectorAll(".path-probability-chart").length, 7);
+			assert.equal(pathButtons(app)[0].querySelectorAll(".path-score")[0].textContent, "+0");
+			assert.equal(pathButtons(app)[1].querySelectorAll(".path-score")[0].textContent, "−0.25");
+			assert.equal(app.get("#path-list").querySelectorAll(".path-probability-bar").length, 14);
+			assert.equal(app.get("#path-probability-guide").textContent,
+				mode === "denoising" ? "Counterfactual ref.PatchedTargetCounterfactualOther" : "CleanPatchedTargetCounterfactualOther");
+			pathButtons(app)[2].emit("click");
+			assert.equal(app.state.pathExplorer.selectedId, "path-3");
+			app.get("#selected-path-diagram").querySelectorAll(".path-component").find((n) => n.dataset.kind === "attn").emit("click");
+			assert.match(app.get("#component-decoding-content").textContent, /␠decoded/);
+			assert.equal(app.get("#component-decoding-content").querySelectorAll(".component-decoding-bar").length, 1);
+			assert.ok(app.get("#grid").querySelectorAll(".path-stroke").length > 0);
+			assert.deepEqual(app.requests, [], "import and subsequent exploration must not call tokenize/search/inference APIs");
+		});
+	}
+
+	test("invalid JSON, incomplete graphs and malformed paths leave the current visualization and caches intact", async () => {
+		const app = appHarness(), valid = exportedResult();
+		await app.importGraphFile(file(valid));
+		app.onClickNode({ id: "a" });
+		pathButtons(app)[2].emit("click");
+		app.state.view = { x: 84, y: -50, k: 1.4 };
+		app.render();
+		const { result, nodes, edges, pathExplorer, previewVersion, view } = app.state;
+		const cached = app.state.savedResults.path, geometry = snapshotGraph(app.get);
+		const summary = app.get("#summary").innerHTML, pathList = app.get("#path-list").children;
+		const invalid = ["{not JSON", "null", "[]", "{}"];
+		for (const mutate of [
+			(r) => { delete r.meta; }, (r) => { r.meta.n_layers = 0; },
+			(r) => { r.meta.method = "unknown"; }, (r) => { r.meta.tokens = [123]; },
+			(r) => { r.graph.nodes = {}; }, (r) => { r.graph.nodes.push(r.graph.nodes[0]); },
+			(r) => { r.graph.nodes[0].contribution = "bad"; },
+			(r) => { r.graph.nodes[0].component_logit_lens.top_tokens = {}; },
+			(r) => { r.graph.edges[0].source = "missing"; }, (r) => { delete r.graph.edges[0].count; },
+			(r) => { r.graph.path_provenance.paths = [null]; },
+			(r) => { r.graph.path_provenance.occurrences = "bad"; },
+			(r) => { r.graph.path_provenance.paths[0].node_ids = ["missing"]; },
+			(r) => { r.graph.edges = []; },
+			(r) => { r.params.prompts = "not an array"; }, (r) => { r.params.mode = "unknown"; },
+		]) {
+			const data = structuredClone(valid); mutate(data); invalid.push(JSON.stringify(data));
+		}
+		for (const text of invalid) {
+			await app.importGraphFile({ name: "invalid.json", text: async () => text });
+			assert.equal(app.get("#graph-import-error").hidden, false);
+			assert.match(app.get("#graph-import-error").textContent, /^Unable to load graph JSON: .+/);
+			assert.equal(app.state.result, result);
+			assert.equal(app.state.nodes, nodes);
+			assert.equal(app.state.edges, edges);
+			assert.equal(app.state.pathExplorer, pathExplorer);
+			assert.equal(app.state.pathExplorer.selectedId, "path-3");
+			assert.equal(app.state.savedResults.path, cached);
+			assert.equal(app.state.previewVersion, previewVersion);
+			assert.equal(app.state.view, view);
+			assert.equal(app.get("#prompts").value, "saved prompt\nsecond prompt");
+			assert.equal(app.get("#summary").innerHTML, summary);
+			assert.equal(app.get("#path-list").children, pathList);
+			assert.deepEqual(snapshotGraph(app.get), geometry);
+		}
+		await app.importGraphFile({ name: "unreadable.json", text: async () => { throw new Error("Read failed"); } });
+		assert.match(app.get("#graph-import-error").textContent, /Read failed/);
+		assert.equal(app.state.result, result);
+		await app.importGraphFile(file(valid));
+		assert.equal(app.get("#graph-import-error").hidden, true, "a valid import clears the previous error");
+	});
+
+	test("missing optional provenance/readouts are reported, never reconstructed or inherited from an earlier result", async () => {
+		const app = appHarness();
+		await app.importGraphFile(file(exportedResult()));
+		const older = exportedResult();
+		delete older.graph.path_provenance;
+		delete older.params;
+		await app.importGraphFile(file(older));
+		app.render();
+		app.onClickNode({ id: "a" });
+		assert.equal(app.state.pathExplorer.index.available, false);
+		assert.equal(app.get("#path-explorer").hidden, true);
+		assert.match(app.get("#status-msg").textContent, /Original path information was not recorded/);
+		assert.match(app.get("#status-msg").textContent, /Experiment parameters were not recorded/);
+		assert.equal(app.get("#prompts").value, "");
+		const missing = exportedResult();
+		delete missing.meta.probability_context;
+		for (const path of missing.graph.path_provenance.paths) {
+			delete path.score; delete path.probability_comparison;
+		}
+		for (const node of missing.graph.nodes) delete node.component_logit_lens;
+		await app.importGraphFile(file(missing));
+		app.onClickNode({ id: "a" });
+		assert.equal(app.get("#path-list").querySelectorAll(".path-probability-chart").length, 0);
+		assert.match(app.get("#path-list").textContent, /Path probabilities unavailable/);
+		assert.equal(pathButtons(app)[0].querySelectorAll(".path-score")[0].textContent, "Unavailable");
+		app.get("#selected-path-diagram").querySelectorAll(".path-component").find((n) => n.dataset.kind === "attn").emit("click");
+		assert.match(app.get("#component-decoding-content").textContent, /No cached component decoding/);
+		assert.deepEqual(app.requests, []);
+	});
+
+	test("ACDC restores head layout and nullable metrics without enabling unsupported path exploration", async () => {
+		const app = appHarness(), data = exportedResult("acdc");
+		delete data.graph.path_provenance;
+		Object.assign(data.meta, { positional: false, layout: "head", acdc_edges: 12, acdc_initial_edges: 20, final_metric: null });
+		for (const node of data.graph.nodes) node.position = null;
+		await app.importGraphFile(file(data));
+		app.render();
+		assert.equal(app.state.method, "acdc");
+		assert.equal(app.state.meta.layout, "head");
+		assert.equal(app.get("#grid").querySelectorAll(".chip").length, data.graph.nodes.length);
+		assert.match(app.get("#summary").innerHTML, /final metric <b>Unavailable/);
+		assert.match(app.get("#summary").innerHTML, /collapsed graph does not retain isolated path interventions/);
+		assert.equal(app.state.pathExplorer.index.available, false);
+		assert.deepEqual(app.requests, []);
+	});
+
+	test("file controls support first-use loading, cancellation, retries, method caches and active-search exclusion", async () => {
+		const app = appHarness(), input = app.get("#graph-file");
+		let opened = false;
+		input.click = () => { opened = true; };
+		app.get("#load-graph").emit("click");
+		assert.equal(opened, true);
+		input.files = [];
+		await input.events.change[0]({ target: input });
+		assert.equal(app.state.result, null);
+		const tree = exportedResult("tree");
+		app.state.savedResults.tree = tree;
+		input.files = [file(exportedResult())];
+		await input.events.change[0]({ target: input });
+		assert.equal(input.value, "");
+		const imported = app.state.savedResults.path;
+		app.selectMethod("tree");
+		assert.equal(app.state.result.graph, tree.graph);
+		app.selectMethod("path");
+		assert.equal(app.state.result.graph, imported.graph);
+		app.setRunning(true);
+		assert.equal(app.get("#load-graph").disabled, true);
+		await app.importGraphFile(file(exportedResult("tree")));
+		assert.match(app.get("#graph-import-error").textContent, /Wait for discovery/);
+		assert.equal(app.state.savedResults.tree, tree);
+		app.setRunning(false);
+		let read;
+		const pending = app.importGraphFile({ name: "ipe_circuit.json", text: () => new Promise((resolve) => { read = resolve; }) });
+		app.setRunning(true);
+		read(JSON.stringify(exportedResult("tree")));
+		await pending;
+		assert.match(app.get("#graph-import-error").textContent, /Discovery started while reading/);
+		assert.equal(app.state.result.graph, imported.graph);
+		assert.equal(app.state.savedResults.tree, tree);
+		assert.deepEqual(app.requests, []);
+	});
+
+	test("imported summary metadata is escaped rather than interpreted as HTML", async () => {
+		const app = appHarness(), data = exportedResult();
+		data.meta.metric = '<img src=x onerror="bad()">';
+		await app.importGraphFile(file(data));
+		assert.equal(app.get("#graph-import-error").hidden, true);
+		assert.match(app.get("#summary").innerHTML, /&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;/);
+		assert.doesNotMatch(app.get("#summary").innerHTML, /<img/);
+	});
+});
 
 function laneSnapshot(grid) {
 	return Object.fromEntries(grid.querySelectorAll(".path-stroke").map((p) => [`${p.dataset.pathId}|${p.dataset.key}`, p.attrs.d]));

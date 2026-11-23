@@ -145,6 +145,7 @@ function clearDisplay(message = "Type a clean prompt to preview the model grid."
 	$("#threshold-val").textContent = "0";
 	$("#summary").innerHTML = "";
 	$("#result-box").hidden = true;
+	$("#download").hidden = true;
 	$("#tooltip").hidden = true;
 	$("#empty-state").textContent = message;
 	scheduleRender();
@@ -1110,6 +1111,7 @@ async function loadConfig() {
 		o.value = o.textContent = m;
 		acdcSel.appendChild(o);
 	}
+	if (state.result) restoreParams(state.result.params, state.method);
 	updateModeHint();
 	applyMethod();
 }
@@ -1153,6 +1155,8 @@ const tokenizePreview = debounce(async () => {
 function setRunning(on) {
 	state.running = on;
 	$("#run").disabled = on;
+	$("#load-graph").disabled = on;
+	$("#load-graph").title = on ? "Wait for discovery to finish or cancel it before loading a graph." : "";
 	$("#cancel").hidden = !on;
 	refreshMethodStatus();
 }
@@ -1284,6 +1288,7 @@ function attachLiveGraph(job, restoreControls = false) {
 	state.displayingLiveRun = Boolean(live.meta);
 	$("#summary").innerHTML = "";
 	$("#result-box").hidden = true;
+	$("#download").hidden = true;
 	if (restoreControls) restoreParams(job.params, job.method);
 	scheduleRender();
 }
@@ -1413,7 +1418,12 @@ function restoreSavedResult(method) {
 	state.result = { graph: saved.graph, meta: saved.meta, params: saved.params };
 	state.pathExplorer = new PathExploration.Explorer(PathExploration.buildIndex(saved.graph, method));
 	state.result.probabilityScale = PathProbabilities.scaleFor(state.pathExplorer.index.paths.values(), saved.meta);
-	restoreParams(saved.params, method);
+	restoreParams(saved.params || {
+		positional: saved.meta.positional,
+		...(method === "acdc" ? { acdc_metric: saved.meta.metric } : {
+			metric: saved.meta.metric, strategy: saved.meta.strategy, mode: saved.meta.mode,
+		}),
+	}, method);
 	showSummary(saved.meta);
 	updatePathControls();
 	scheduleRender();
@@ -1445,6 +1455,14 @@ function restoreDraft(draft, method) {
 
 function restoreParams(params, method) {
 	if (!params) return;
+	// An exported model/metric may not be in this server's configured choices.
+	for (const [selector, key] of [["#model", "model"], ["#metric", "metric"], ["#acdc-metric", "acdc_metric"]]) {
+		if (params[key] && ![...$(selector).options].some((option) => option.value === params[key])) {
+			const option = document.createElement("option");
+			option.value = option.textContent = params[key];
+			$(selector).appendChild(option);
+		}
+	}
 	applyFormState({
 		...params,
 		prompts: (params.prompts || []).join("\n"),
@@ -1502,16 +1520,16 @@ function applyFormState(values, method) {
 
 function showSummary(meta) {
 	const bits = [
-		`<b>${meta.method}</b> search (${meta.strategy}), <b>${meta.mode}</b>, metric <b>${meta.metric}</b>`,
-		`runtime <b>${meta.runtime}s</b>`,
-		`${meta.n_nodes} grid nodes, ${meta.n_edges} edges`,
+		`<b>${escapeHtml(meta.method)}</b> search (${escapeHtml(meta.strategy ?? "unavailable")}), <b>${escapeHtml(meta.mode ?? "unavailable")}</b>, metric <b>${escapeHtml(meta.metric ?? "unavailable")}</b>`,
+		`runtime <b>${meta.runtime == null ? "Unavailable" : `${escapeHtml(meta.runtime)}s`}</b>`,
+		`${escapeHtml(meta.n_nodes)} grid nodes, ${escapeHtml(meta.n_edges)} edges`,
 	];
 	if (meta.joint_tree_contribution !== null && meta.joint_tree_contribution !== undefined) {
 		bits.push(`joint tree contribution <b>${fmt(meta.joint_tree_contribution)}</b>`);
 	}
 	if (meta.acdc_edges !== undefined) {
-		bits.push(`ACDC kept <b>${meta.acdc_edges}</b> of ${meta.acdc_initial_edges} hook-level edges`);
-		bits.push(`final metric <b>${meta.final_metric.toFixed(4)}</b>`);
+		bits.push(`ACDC kept <b>${escapeHtml(meta.acdc_edges)}</b> of ${escapeHtml(meta.acdc_initial_edges)} hook-level edges`);
+		bits.push(`final metric <b>${meta.final_metric == null ? "Unavailable" : meta.final_metric.toFixed(4)}</b>`);
 	}
 	if (meta.method === "acdc") bits.push("Path probabilities unavailable: ACDC's collapsed graph does not retain isolated path interventions.");
 	$("#summary").innerHTML = bits.join("<br>");
@@ -1522,6 +1540,116 @@ function showSummary(meta) {
 	$("#threshold-val").textContent = "0";
 	state.threshold = 0;
 	$("#result-box").hidden = false;
+	$("#download").hidden = false;
+}
+
+/* -------------------------------------------------------------- JSON import */
+
+function parseGraphJSON(text) {
+	let saved;
+	try { saved = JSON.parse(text); }
+	catch { throw new Error("Invalid JSON. Select a file exported with Download graph JSON."); }
+	const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+	const strings = (value) => Array.isArray(value) && value.every((item) => typeof item === "string");
+	const optionalNumber = (value) => value == null || Number.isFinite(value);
+	const index = (value, limit) => Number.isInteger(value) && value >= 0 && value < limit;
+	if (!object(saved) || !object(saved.graph) || !object(saved.meta)
+		|| !Array.isArray(saved.graph.nodes) || !Array.isArray(saved.graph.edges)) {
+		throw new Error("Missing graph.nodes, graph.edges or meta.");
+	}
+	const { graph, meta, params } = saved;
+	if (!["tree", "path", "acdc"].includes(meta.method)
+		|| !strings(meta.tokens) || !meta.tokens.length
+		|| !Number.isInteger(meta.n_layers) || meta.n_layers < 1
+		|| !Number.isInteger(meta.n_heads) || meta.n_heads < 1 || typeof meta.positional !== "boolean"
+		|| ["strategy", "mode", "metric", "layout"].some((key) => meta[key] != null && typeof meta[key] !== "string")
+		|| ["runtime", "joint_tree_contribution", "final_metric", "acdc_edges", "acdc_initial_edges"]
+			.some((key) => !optionalNumber(meta[key]))) {
+		throw new Error("Invalid metadata: expected method, tokens, positive n_layers/n_heads and positional.");
+	}
+	const ids = new Set();
+	for (const node of graph.nodes) {
+		if (!object(node) || typeof node.id !== "string" || !node.id || ids.has(node.id)
+			|| !["embed", "final", "attn", "mlp"].includes(node.kind)
+			|| (["attn", "mlp"].includes(node.kind) && !index(node.layer, meta.n_layers))
+			|| (node.kind === "attn" && node.head != null && !index(node.head, meta.n_heads))
+			|| (node.position != null && !index(node.position, meta.tokens.length))
+			|| !optionalNumber(node.contribution)
+			|| (node.variants != null && !strings(node.variants))
+			|| (node.kv_positions != null && (!Array.isArray(node.kv_positions)
+				|| !node.kv_positions.every((p) => Number.isInteger(p) && p >= 0)))
+			|| (node.component_logit_lens?.top_tokens != null
+				&& (!Array.isArray(node.component_logit_lens.top_tokens)
+					|| !node.component_logit_lens.top_tokens.every(object)))) {
+			throw new Error("Invalid graph node: check IDs, component coordinates and contributions.");
+		}
+		ids.add(node.id);
+	}
+	for (const edge of graph.edges) {
+		if (!object(edge) || !ids.has(edge.source) || !ids.has(edge.target)
+			|| !Number.isInteger(edge.count) || edge.count < 1 || !optionalNumber(edge.contribution)) {
+			throw new Error("Invalid graph edge: expected existing source/target nodes and a positive count.");
+		}
+	}
+	const provenance = graph.path_provenance;
+	if (provenance != null) {
+		if (!object(provenance) || provenance.version !== 1 || provenance.source !== meta.method
+			|| !Array.isArray(provenance.paths)
+			|| (provenance.occurrences != null && (!Array.isArray(provenance.occurrences)
+				|| !provenance.occurrences.every((n) => object(n) && typeof n.id === "string" && ids.has(n.node_id))))) {
+			throw new Error("Invalid or unsupported path provenance.");
+		}
+		const pathIds = new Set(), edges = new Set(graph.edges.map((e) => `${e.source}->${e.target}`));
+		for (const path of provenance.paths) {
+			if (!object(path) || typeof path.id !== "string" || !path.id || pathIds.has(path.id)
+				|| typeof path.complete !== "boolean" || !strings(path.node_ids) || !path.node_ids.length
+				|| path.node_ids.some((id) => !ids.has(id)) || !optionalNumber(path.score)
+				|| (path.occurrence_ids != null && !strings(path.occurrence_ids))
+				|| path.node_ids.some((id, i, sequence) => i && id !== sequence[i - 1]
+					&& !edges.has(`${sequence[i - 1]}->${id}`))) {
+				throw new Error("Invalid path information: check path IDs, nodes, edges and scores.");
+			}
+			pathIds.add(path.id);
+		}
+	}
+	if (params != null && (!object(params)
+		|| ["prompts", "targets", "cf_prompts", "cf_targets"].some((key) => params[key] != null && !strings(params[key]))
+		|| ["model", "metric", "acdc_metric"].some((key) => params[key] != null && typeof params[key] !== "string")
+		|| ["min_contribution", "max_width", "acdc_threshold"].some((key) => !optionalNumber(params[key]))
+		|| ["positional", "include_negative", "acdc_abs_threshold"]
+			.some((key) => params[key] != null && typeof params[key] !== "boolean")
+		|| (params.method != null && params.method !== meta.method)
+		|| (params.strategy != null && !["threshold", "topk"].includes(params.strategy))
+		|| (params.mode != null && !["noising", "denoising"].includes(params.mode)))) {
+		throw new Error("Invalid experiment parameters.");
+	}
+	return { graph, meta: { ...meta, n_nodes: graph.nodes.length, n_edges: graph.edges.length }, params };
+}
+
+async function importGraphFile(file) {
+	if (!file) return;
+	const error = $("#graph-import-error");
+	try {
+		if (state.running) throw new Error("Wait for discovery to finish or cancel it before loading a graph.");
+		const saved = parseGraphJSON(await file.text());
+		if (state.running) throw new Error("Discovery started while reading the file. Try loading it again when finished.");
+		state.previewVersion += 1;
+		state.drafts[state.method] = state.savedResults[state.method] ? null : captureFormState();
+		const method = saved.meta.method;
+		state.savedResults[method] = saved;
+		state.view = { x: 16, y: 8, k: 1 };
+		restoreSavedResult(method);
+		setProgress(1, "", method);
+		setStatus(`Loaded ${file.name}.`
+			+ (!state.pathExplorer.index.available && method !== "acdc"
+				? " Original path information was not recorded; Path Explorer is unavailable." : "")
+			+ (!saved.params ? " Experiment parameters were not recorded; form defaults are shown." : ""), method);
+		error.hidden = true;
+		error.textContent = "";
+	} catch (e) {
+		error.textContent = `Unable to load graph JSON: ${e.message}`;
+		error.hidden = false;
+	}
 }
 
 /* -------------------------------------------------------------- wire up UI */
@@ -1669,6 +1797,11 @@ function init() {
 		a.download = "ipe_circuit.json";
 		a.click();
 		URL.revokeObjectURL(a.href);
+	});
+	$("#load-graph").addEventListener("click", () => $("#graph-file").click());
+	$("#graph-file").addEventListener("change", async (event) => {
+		await importGraphFile(event.target.files[0]);
+		event.target.value = ""; // Allow selecting the same file again after an error.
 	});
 
 	window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", scheduleRender);
